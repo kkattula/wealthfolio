@@ -1,0 +1,118 @@
+import { render, screen } from "@testing-library/react";
+import { FormattingProvider } from "@wealthfolio/ui";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
+
+import { SavingGoals } from "./goals";
+
+const queryMocks = vi.hoisted(() => ({ unavailable: false }));
+
+vi.mock("@/lib/settings-provider", () => ({
+  useSettingsContext: () => ({ settings: { timezone: "Asia/Shanghai", baseCurrency: "CAD" } }),
+}));
+
+vi.mock("@tanstack/react-query", () => ({
+  useQuery: () => ({
+    data: [
+      {
+        id: "goal-1",
+        goalType: "retirement",
+        title: "Retirement",
+        statusLifecycle: "active",
+        statusHealth: "at_risk",
+        priority: 1,
+        // Saved while the base currency was USD; amounts are in the current base currency.
+        currency: "USD",
+        targetDate: "2034-08-09",
+        summaryCurrentValue: queryMocks.unavailable ? null : 980_000,
+        summaryTargetAmount: 3_433_731,
+        summaryProgress: queryMocks.unavailable ? null : 0.285,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
+    ],
+    isLoading: false,
+  }),
+}));
+
+vi.mock("@/hooks/use-balance-privacy", () => ({
+  useBalancePrivacy: () => ({ isBalanceHidden: false }),
+}));
+
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: { count?: number; years?: number; months?: number }) => {
+      if (key === "goals:card.months_left") return `${options?.count} MOIS RESTANTS`;
+      if (key === "goals:card.years_left") return `${options?.count} ANS RESTANTS`;
+      if (key === "goals:card.years_months_left") {
+        return `${options?.years} A ${options?.months} M RESTANTS`;
+      }
+      return key;
+    },
+  }),
+}));
+
+describe("SavingGoals localization", () => {
+  beforeAll(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-18T12:00:00Z"));
+  });
+
+  afterAll(() => {
+    vi.useRealTimers();
+  });
+
+  it("marks a deadline due on the configured calendar day", () => {
+    vi.setSystemTime(new Date("2034-08-08T16:30:00Z"));
+    render(
+      <MemoryRouter>
+        <FormattingProvider locale="en-US">
+          <SavingGoals />
+        </FormattingProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("dashboard:goals.time_due")).toBeInTheDocument();
+    vi.setSystemTime(new Date("2026-08-18T12:00:00Z"));
+  });
+
+  it("shows unavailable savings instead of zero progress", () => {
+    queryMocks.unavailable = true;
+    try {
+      render(
+        <MemoryRouter>
+          <SavingGoals />
+        </MemoryRouter>,
+      );
+      expect(screen.getAllByText(/N\/A/)).toHaveLength(2);
+      expect(screen.queryByText(/^0%$/)).not.toBeInTheDocument();
+    } finally {
+      queryMocks.unavailable = false;
+    }
+  });
+
+  it("formats progress and remaining time with the active locales", () => {
+    render(
+      <MemoryRouter>
+        <FormattingProvider locale="fr-FR" uiLocale="fr">
+          <SavingGoals />
+        </FormattingProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/^29[\u00a0\u202f ]%$/)).toBeInTheDocument();
+    expect(screen.getByText("7 A 11 M RESTANTS")).toBeInTheDocument();
+  });
+
+  it("formats amounts in the base currency, not the goal's saved currency", () => {
+    render(
+      <MemoryRouter>
+        <FormattingProvider locale="en-CA">
+          <SavingGoals />
+        </FormattingProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/\$980K/)).toBeInTheDocument();
+    expect(screen.queryByText(/US\$/)).not.toBeInTheDocument();
+  });
+});

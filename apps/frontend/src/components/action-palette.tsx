@@ -1,0 +1,163 @@
+import { useHapticFeedback } from "@/hooks";
+import { Button } from "@wealthfolio/ui/components/ui/button";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import { Popover, PopoverContent, PopoverTrigger } from "@wealthfolio/ui/components/ui/popover";
+import { cn } from "@wealthfolio/ui/lib/utils";
+import * as React from "react";
+import { useTranslation } from "react-i18next";
+
+export interface ActionPaletteItem {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  onClick: () => void;
+  testId?: string;
+  variant?: "default" | "destructive";
+  disabled?: boolean;
+  checked?: boolean;
+}
+
+export interface ActionPaletteGroup {
+  title?: string;
+  items: ActionPaletteItem[];
+}
+
+interface ActionPaletteProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title?: string;
+  groups: ActionPaletteGroup[];
+  trigger?: React.ReactElement;
+  align?: "start" | "center" | "end";
+  side?: "top" | "bottom" | "left" | "right";
+}
+
+export function ActionPalette({
+  open,
+  onOpenChange,
+  title,
+  groups,
+  trigger,
+  align = "end",
+  side = "bottom",
+}: ActionPaletteProps) {
+  const { t } = useTranslation();
+  const { triggerHaptic } = useHapticFeedback();
+
+  const handleItemClick = React.useCallback(
+    (item: ActionPaletteItem) => {
+      triggerHaptic();
+      item.onClick();
+      onOpenChange(false);
+    },
+    [triggerHaptic, onOpenChange],
+  );
+
+  const handleClose = React.useCallback(() => {
+    onOpenChange(false);
+  }, [onOpenChange]);
+
+  return (
+    <Popover open={open} onOpenChange={onOpenChange}>
+      <PopoverTrigger
+        render={
+          trigger ?? (
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-9 w-9"
+              aria-label={t("common:layout.more_options")}
+            >
+              <Icons.DotsThreeVertical className="h-5 w-5" weight="fill" />
+            </Button>
+          )
+        }
+      />
+      {/* Keep touch-sized rows unless the viewport is lg+ and the primary pointer is fine. */}
+      <PopoverContent
+        align={align}
+        side={side}
+        sideOffset={8}
+        aria-label={title ?? t("common:actions")}
+        className="w-auto max-w-80 min-w-65 p-0 lg:pointer-fine:min-w-56"
+      >
+        {/* Header - only show if title provided */}
+        {title && (
+          <div className="flex items-center justify-between gap-2 px-5 pt-5 pb-3 lg:pointer-fine:px-4 lg:pointer-fine:pt-3 lg:pointer-fine:pb-1">
+            <h3 className="text-foreground text-lg font-bold lg:pointer-fine:text-sm lg:pointer-fine:font-semibold">
+              {title}
+            </h3>
+            <button
+              onClick={handleClose}
+              className={cn(
+                "flex size-8 shrink-0 items-center justify-center rounded-full lg:pointer-fine:size-7",
+                "bg-muted/80 hover:bg-muted",
+                "text-muted-foreground hover:text-foreground",
+                "transition-colors duration-150",
+                "focus-visible:ring-ring focus:outline-none focus-visible:ring-2",
+              )}
+              aria-label={t("common:close")}
+            >
+              <Icons.X className="size-4 lg:pointer-fine:size-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* Action Groups */}
+        <div
+          className={cn(
+            "px-3 pb-4 lg:pointer-fine:px-1.5 lg:pointer-fine:pb-1.5",
+            !title && "pt-3 lg:pointer-fine:pt-1.5",
+          )}
+        >
+          {groups.map((group, groupIndex) => (
+            <div key={groupIndex}>
+              {group.title && (
+                <div className="text-muted-foreground px-2 py-1.5 text-xs font-medium tracking-wider uppercase">
+                  {group.title}
+                </div>
+              )}
+              <div>
+                {group.items.map((item, itemIndex) => {
+                  const IconComponent = item.icon;
+                  const isDestructive = item.variant === "destructive";
+                  return (
+                    <React.Fragment key={itemIndex}>
+                      {itemIndex > 0 && <div className="bg-border/70 mx-3 h-px" />}
+                      <button
+                        data-testid={item.testId}
+                        disabled={item.disabled}
+                        aria-pressed={item.checked}
+                        onClick={() => handleItemClick(item)}
+                        className={cn(
+                          "disabled:pointer-events-none disabled:opacity-50",
+                          "flex w-full items-center gap-4 rounded-xl px-3 py-3 lg:pointer-fine:gap-2.5 lg:pointer-fine:rounded-lg lg:pointer-fine:py-2",
+                          "transition-colors duration-150",
+                          isDestructive
+                            ? "text-destructive hover:bg-destructive-subtle hover:text-destructive-subtle-foreground active:bg-destructive-subtle/70"
+                            : "text-foreground hover:bg-accent active:bg-accent/80",
+                          "focus-visible:ring-ring focus:outline-none focus-visible:ring-2 focus-visible:ring-inset",
+                        )}
+                      >
+                        <IconComponent
+                          className={cn(
+                            "size-5 shrink-0 lg:pointer-fine:size-4",
+                            isDestructive ? "text-destructive" : "text-muted-foreground",
+                          )}
+                        />
+                        <span className="text-base font-medium lg:pointer-fine:text-sm lg:pointer-fine:font-normal">
+                          {item.label}
+                        </span>
+                        {item.checked && <Icons.Check className="ms-auto size-4 shrink-0" />}
+                      </button>
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+              {groupIndex < groups.length - 1 && <div className="bg-border/70 mx-3 my-1.5 h-px" />}
+            </div>
+          ))}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}

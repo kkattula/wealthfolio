@@ -1,0 +1,149 @@
+import { installProfileSession } from "@/features/profiles/session";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setUnauthorizedHandler } from "@/lib/auth-token";
+
+const mocks = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  logger: {
+    error: vi.fn(),
+  },
+}));
+
+vi.mock("./core", () => ({
+  API_PREFIX: "/api/v1",
+  invoke: mocks.invoke,
+  logger: mocks.logger,
+}));
+
+import {
+  exportDatabaseBackup,
+  getSettings,
+  inspectDatabaseBackup,
+  inspectSavedDatabaseBackup,
+  isAutoUpdateCheckEnabled,
+  restoreDatabaseBackupImport,
+  discardDatabaseBackupImport,
+} from "./settings";
+
+beforeEach(() => {
+  installProfileSession({ profileId: "test", scopeId: "scope-test" });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  setUnauthorizedHandler(null);
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+it.each(["caller", "deadline"])(
+  "keeps backup export cancellable by %s and clears its timer",
+  async (cause) => {
+    vi.useFakeTimers();
+    const caller = new AbortController();
+    const fetch = vi.fn(
+      (_url, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal!.addEventListener("abort", () => reject(init.signal!.reason as Error), {
+            once: true,
+          });
+        }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const result = exportDatabaseBackup("backup.db", null, true, caller.signal);
+    const assertion = expect(result).rejects.toMatchObject({
+      name: cause === "caller" ? "AbortError" : "TimeoutError",
+    });
+    if (cause === "caller") caller.abort();
+    else {
+      await vi.advanceTimersByTimeAsync(1_919_999);
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    await assertion;
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  },
+);
+
+it.each([401, 500])(
+  "notifies the auth gate only for an unauthorized export: %s",
+  async (status) => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        status,
+        ok: false,
+        json: () => Promise.resolve({ message: "Export rejected" }),
+      }),
+    );
+
+    await expect(exportDatabaseBackup("backup.db", null, true)).rejects.toThrow("Export rejected");
+    expect(handler).toHaveBeenCalledTimes(status === 401 ? 1 : 0);
+  },
+);
+
+it("downloads through a browser link without buffering the backup into a Blob", async () => {
+  const blob = vi.fn();
+  const fetch = vi.fn().mockResolvedValue({
+    ok: true,
+    headers: new Headers({ "Content-Type": "application/json" }),
+    json: async () => ({ id: "job-id", filename: "backup.db" }),
+    blob,
+  });
+  vi.stubGlobal("fetch", fetch);
+  let target = "";
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    target = this.href;
+  });
+  expect(await exportDatabaseBackup("selected.db", null, true)).toBe(true);
+  const [url, options] = fetch.mock.calls[0];
+  expect(url).toContain("/backups/selected.db/export");
+  expect(options.credentials).toBe("same-origin");
+  expect(options.headers.get("X-Wealthfolio-Backup")).toBe("1");
+  expect(JSON.parse(options.body)).toEqual({ password: null, unencrypted: true });
+  expect(target).toContain("/utilities/database/exports/job-id");
+  expect(blob).not.toHaveBeenCalled();
+});
+
+describe("web getSettings", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("propagates backend failures", async () => {
+    const error = new Error("Backend unavailable");
+    mocks.invoke.mockRejectedValue(error);
+
+    await expect(getSettings()).rejects.toThrow("Backend unavailable");
+    expect(mocks.logger.error).toHaveBeenCalledWith("Error fetching settings.");
+  });
+});
+
+describe("web isAutoUpdateCheckEnabled", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("skips automatic checks when the setting can't be read", async () => {
+    // A reload or navigation cancels the read while the page's scripts still run.
+    mocks.invoke.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    expect(await isAutoUpdateCheckEnabled()).toBe(false);
+    expect(mocks.logger.error).toHaveBeenCalledWith("Error checking auto-update setting.");
+  });
+});
+
+it("rejects every restore entry point without making a server request", async () => {
+  const fetch = vi.fn();
+  vi.stubGlobal("fetch", fetch);
+  await expect(inspectDatabaseBackup(new File(["backup"], "backup.db"), null)).rejects.toThrow();
+  await expect(inspectSavedDatabaseBackup("backup.db")).rejects.toThrow();
+  await expect(restoreDatabaseBackupImport("preview-id")).rejects.toThrow();
+  await expect(discardDatabaseBackupImport("preview-id")).rejects.toThrow();
+  expect(fetch).not.toHaveBeenCalled();
+});

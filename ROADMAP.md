@@ -1,67 +1,116 @@
-Here is a draft of my vision to this project. Any ideas are welcome:
+# Wealthfolio Roadmap
 
 ## Vision
 
-To help individuals build their wealth by providing a safe, privacy-focused and easy-to-use tool to
-track their investments and goals.
+To help individuals build their wealth by providing a safe, privacy-focused and
+easy-to-use tool to track their investments, net worth, spending and goals.
 
 ## Strategy
 
-1. Build a polished application that focuses on the essentials
-2. Underdo the competition by offering a simpler, more focused alternative
-3. Fight feature creep and resist creating a bloated app
-4. Avoid complexity at all costs
-5. Provide clear insights on how your portfolio is performing against your goals
+1. Build a polished application that does the essentials well
+2. Simple by default: advanced features are opt-in and stay out of the way
+3. Go deeper on what people already track before adding new areas
+4. Fight feature creep: every feature has to earn its place
+5. Provide clear insights on how your wealth is tracking against your goals
 
 ## What We Believe In
 
-1. Your Privacy: Your money info stays on your computer. You retain complete control over your
-   financial information..
-2. Easy to Use: Anyone can track their investments with our simple design.
-3. No Hidden Costs: Free or Pay once to support. Use forever—no surprise fees or subscriptions.
-4. Lots of Features: Track many types of investments and use helpful tools.
-5. Beautiful, Focused, and Boring App: We believe in crafting an app that's visually appealing yet
-   doesn't distract from its core purpose.
+1. **Your Privacy**: Your money info stays on your computer. You retain complete
+   control over your financial information.
+2. **Easy to Use**: Anyone can track their investments with our simple design.
+3. **No Lock-in**: Free or pay once to support. Wealthfolio Connect as optional
+   paid subscription to sync broker data and devices.
+4. **Extensible**: Through the addons system and catalog, users can easily
+   enhance functionality.
+5. **Beautiful and Focused**: We believe in crafting an app that's visually
+   appealing yet doesn't distract from its core purpose.
 
 ## Roadmap
 
-### Step 1: The Basics (Now)
+### Phase 1: Foundation (Completed)
 
-- [x] Track your investments
-- [x] Store data on your computer
-- [x] Simple, easy-to-use design
+- [x] Track investments across multiple accounts
+- [x] Local-first data storage (SQLite)
+- [x] Simple, intuitive design
+- [x] Multi-currency support with exchange rates
+- [x] Performance analytics and historical tracking
 
-### Step 2: More Features (Next 3-6 months)
+### Phase 2: Core Features (Completed)
 
-- [ ] Let you export your data (CSV, sqlite file, json)
-- [ ] Support another market data API (Bring your own API keys) (example
-      https://www.alphavantage.co)
-- [ ] Support Stock Splitting
-- [ ] Let you track more things like houses, gold, and cars
-- [ ] Enhance portfolio History calculation
-- [ ] Build install packages for the remaining platforms
+- [x] Data export (CSV, SQLite, JSON)
+- [x] Multiple market data providers (Yahoo Finance, Alpha Vantage,
+      MarketData.app, Finnhub, Börse Frankfurt, AMFI, Metal Price API)
+- [x] Stock split handling
+- [x] Enhanced portfolio history calculation
+- [x] Cross-platform builds (Windows, macOS, Linux)
+- [x] Advanced CSV import with field mapping
+- [x] Addons system for extending functionality
 
-### Step 3: Smart Tools (6-12 months)
+### Phase 3: Multi-Platform (Completed)
 
-- [ ] Advanced CSV import
-- [ ] Some portfolio analysis and insights
-- [ ] Add Monte-Carlo projection
-- [ ] Support another market data API
+- [x] Self-hosted web app with Docker support
+- [x] REST API server (Axum)
+- [x] Mobile apps (iOS and Android via Tauri)
+- [x] Wealthfolio Connect: Device sync with end-to-end encryption (E2EE)
+- [x] Wealthfolio Connect: broker data sync service
+- [x] Wealthfolio Connect: encrypted cloud backups
 
-### Step 4: Growing (12-18 months)
+### Phase 4: Investment and Wealth Tracking (Completed)
 
-- [ ] Make a mobile app that works with your phone securely
-- [ ] Connect with some brokers/ plateform to fetch and update activities automatically
+- [x] Liabilities and debt tracking
+- [x] Loans and mortgages with amortization schedules
+- [x] Alternative assets (real estate, vehicles, collectibles)
+- [x] Options trading support
+- [x] Track short positions (stocks, ETFs and options)
+- [x] Cost basis methods per account (FIFO, weighted average, LIFO, HIFO)
 
-### Step 5: Building a Community (18+ months)
+### Phase 5: Smart Tools (Completed)
 
-- [ ] Add support for Options trading
+- [x] AI assistant (local models via Ollama or an OpenAI-compatible server such
+      as LM Studio, or your own key for OpenAI, Anthropic, Google Gemini, Groq
+      or OpenRouter)
+- [x] Save-up goals simulation
+- [x] Retirement/FIRE simulator
+
+### Phase 6: Ecosystem (Completed)
+
+- [x] Addons catalog/marketplace for community addons
+- [x] Custom Market Data providers
+
+### Phase 7: Budgeting and Spend Tracking (Completed)
+
+- [x] Budgeting and spend tracking (categories, rules, budgets, events and
+      insights)
+
+### Phase 8: Platform Expansion (Completed)
+
+- [x] MCP server for AI agents (AI Agent Access)
+- [x] Create and manage multiple portfolios
+- [x] Portfolio Allocation and Rebalancing
+- [x] Android Mobile app
+- [x] SSO in self-hosted version (OpenID Connect)
+- [x] Separate profiles with app lock
+- [x] Optional database encryption and password-protected backups
+- [x] 11 languages, including right-to-left Arabic
+
+### Up Next
+
+- [ ] CLI for agents
+- [ ] Margin accounts
+- [ ] Cross-account cost basis (ACB) and specific-lot selection
 
 ### Always Doing
 
 - Keeping the app safe and up-to-date
-- Making the app faster and bette using user feedback
+- Performance improvements based on user feedback
+- Security audits and privacy enhancements
 
-We're building Wealthfolio to be a great alternative to online investment trackers. Our plan might
-change based on what users tell us they want, but we'll always focus on keeping your data private
-and helping you manage your money better.
+---
+
+We're building Wealthfolio to be a great alternative to online investment
+trackers. Our plan might change based on what users tell us they want, but we'll
+always focus on keeping your data private and helping you manage your money
+better.
+
+Ideas and feedback welcome - open an issue or join our
+[Discord](https://discord.gg/WDMCY6aPWK).

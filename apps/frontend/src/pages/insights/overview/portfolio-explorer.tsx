@@ -1,0 +1,430 @@
+import { localizeAllocation } from "@/lib/taxonomy-labels";
+import type { TFunction } from "i18next";
+import { useAccountsSimplePerformance } from "@/hooks/use-accounts-simple-performance";
+import type {
+  Account,
+  AccountValueSource,
+  Holding,
+  PortfolioAllocations,
+  TaxonomyAllocation,
+} from "@/lib/types";
+import { cn } from "@/lib/utils";
+import {
+  Card,
+  CardTitle,
+  Icons,
+  PrivacyAmount,
+  Skeleton,
+  useNumberFormatting,
+} from "@wealthfolio/ui";
+import { useMemo, useState, useSyncExternalStore } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  fallbackPalette,
+  getTreemapPaletteSnapshot,
+  readableLabelColors,
+  subscribeToTreemapTheme,
+} from "@/pages/holdings/components/treemap-palette";
+import {
+  accountTreeWeights,
+  buildBreakdownTree,
+  currencyLensItems,
+  OTHER_COLOR,
+  toBreakdownNodes,
+  type BreakdownNode,
+} from "./allocation-derivations";
+import { LensSwitcher } from "./lens-switcher";
+
+interface PortfolioExplorerProps {
+  allocations?: PortfolioAllocations;
+  holdings: Holding[];
+  accounts: Account[];
+  /** In-scope account ids — drives per-account valuations for the Accounts/Groups lenses. */
+  accountIds?: string[];
+  accountValuations?: AccountValueSource[];
+  currency: string;
+  isLoading?: boolean;
+  onOpenAllocation: (allocation: TaxonomyAllocation, categoryId?: string) => void;
+}
+
+interface Lens {
+  key: string;
+  label: string;
+  unit: string;
+  nodes: BreakdownNode[];
+  /** Underlying item count when it differs from the top-level row count (grouped rows). */
+  count?: number;
+  /** Taxonomy backing the lens; when present, leaf rows open the detail sheet. */
+  allocation?: TaxonomyAllocation;
+}
+
+function sumOfCategories(allocation: TaxonomyAllocation | undefined): number {
+  return (allocation?.categories ?? []).reduce((s, c) => s + (c.value > 0 ? c.value : 0), 0);
+}
+
+/** Rows kept before the rest collapse into one "Other" row; the labels count rows, not underlying items. */
+const COLLAPSED_TOP_N = 5;
+
+function sumValue(nodes: BreakdownNode[]): number {
+  return nodes.reduce((s, n) => s + n.value, 0);
+}
+
+/** Collapse top-level nodes to top-N + an aggregated "Other" row (keeps children on the top-N). */
+function collapseWeights(
+  nodes: BreakdownNode[],
+  topN: number,
+  otherLabel: string,
+): BreakdownNode[] {
+  if (nodes.length <= topN + 1) return nodes;
+  const top = nodes.slice(0, topN);
+  const rest = nodes.slice(topN);
+  return [
+    ...top,
+    {
+      id: "__other__",
+      name: otherLabel,
+      value: rest.reduce((s, n) => s + n.value, 0),
+      percentage: rest.reduce((s, n) => s + n.percentage, 0),
+      color: OTHER_COLOR,
+      depth: 0,
+    },
+  ];
+}
+
+function SegmentedBar({ nodes }: { nodes: BreakdownNode[] }) {
+  const numbers = useNumberFormatting();
+  // Each label takes the theme's dark or light label colour, whichever reads better on
+  // its segment, as the treemap's tiles do; both follow the theme and mode.
+  const palette = useSyncExternalStore(
+    subscribeToTreemapTheme,
+    getTreemapPaletteSnapshot,
+    () => fallbackPalette,
+  );
+  const labelColors = useMemo(
+    () =>
+      readableLabelColors(
+        nodes.map((node) => node.color),
+        palette,
+      ),
+    [nodes, palette],
+  );
+  return (
+    <div className="bg-muted flex h-6 w-full overflow-hidden rounded-lg">
+      {nodes.map((node, index) => (
+        <div
+          key={node.id}
+          className="flex h-full items-center overflow-hidden px-2"
+          style={{
+            flex: `${Math.max(node.percentage, 0.5)} 1 0%`,
+            background: node.color,
+            boxShadow: index === 0 ? undefined : "inset 2px 0 0 var(--card)",
+          }}
+          title={`${node.name} · ${numbers.formatPercent(node.percentage / 100, { digits: 1 })}`}
+        >
+          {node.percentage >= 8 && (
+            <span
+              className="text-2xs truncate font-bold text-white/95"
+              style={{ color: labelColors[index] }}
+            >
+              {node.name}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function taxonomyLens(
+  key: string,
+  label: string,
+  unit: string,
+  allocation: TaxonomyAllocation | undefined,
+  t: TFunction,
+): Lens {
+  const displayAllocation = allocation ? localizeAllocation(t, allocation) : undefined;
+  return {
+    key,
+    label,
+    unit,
+    nodes: buildBreakdownTree(
+      displayAllocation?.categories,
+      sumOfCategories(allocation),
+      (categoryName) => t("common:allocation_other_in_category", { category: categoryName }),
+    ),
+    allocation,
+  };
+}
+
+/** Accounts lens: rows are groups, so the count has to reach through to the accounts. */
+function accountsLens(label: string, unit: string, nodes: BreakdownNode[]): Lens {
+  return {
+    key: "accounts",
+    label,
+    unit,
+    nodes,
+    count: nodes.reduce((s, n) => s + (n.children?.length ?? 1), 0),
+  };
+}
+
+/** Lens-based breakdown of the portfolio: allocation, accounts, sectors, regions, risk, types, currency, custom groups. */
+export function PortfolioExplorer({
+  allocations,
+  holdings,
+  accounts,
+  accountIds,
+  accountValuations,
+  currency,
+  isLoading,
+  onOpenAllocation,
+}: PortfolioExplorerProps) {
+  const { t } = useTranslation();
+  const numbers = useNumberFormatting();
+  const [activeKey, setActiveKey] = useState("allocation");
+  const [showAll, setShowAll] = useState(false);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const scopedAccounts = useMemo(
+    () => (accountIds ? accounts.filter((a) => accountIds.includes(a.id)) : accounts),
+    [accounts, accountIds],
+  );
+  const { data: performance = [] } = useAccountsSimplePerformance(scopedAccounts, {
+    enabled: accountValuations === undefined,
+  });
+  const accountValues = accountValuations ?? performance;
+
+  const lenses = useMemo<Lens[]>(() => {
+    const list: Lens[] = [
+      taxonomyLens(
+        "allocation",
+        t("insights:insights.explorer.lens_allocation"),
+        t("insights:insights.explorer.unit_categories"),
+        allocations?.assetClasses,
+        t,
+      ),
+      accountsLens(
+        t("insights:insights.explorer.lens_accounts"),
+        t("insights:insights.explorer.unit_accounts"),
+        accountTreeWeights(accountValues, scopedAccounts),
+      ),
+      taxonomyLens(
+        "sectors",
+        t("insights:insights.explorer.lens_sectors"),
+        t("insights:insights.explorer.unit_sectors"),
+        allocations?.sectors,
+        t,
+      ),
+      taxonomyLens(
+        "regions",
+        t("insights:insights.explorer.lens_regions"),
+        t("insights:insights.explorer.unit_regions"),
+        allocations?.regions,
+        t,
+      ),
+      taxonomyLens(
+        "risk",
+        t("insights:insights.explorer.lens_risk"),
+        t("insights:insights.explorer.unit_levels"),
+        allocations?.riskCategory,
+        t,
+      ),
+      taxonomyLens(
+        "security",
+        t("insights:insights.explorer.lens_security"),
+        t("insights:insights.explorer.unit_types"),
+        allocations?.securityTypes,
+        t,
+      ),
+      {
+        key: "currency",
+        label: t("insights:insights.explorer.lens_currency"),
+        unit: t("insights:insights.explorer.unit_currencies"),
+        nodes: toBreakdownNodes(currencyLensItems(holdings)),
+      },
+    ];
+    // Each custom-group taxonomy becomes its own lens.
+    for (const taxonomy of allocations?.customGroups ?? []) {
+      if (taxonomy.categories.some((c) => c.value > 0)) {
+        list.push(
+          taxonomyLens(
+            taxonomy.taxonomyId,
+            taxonomy.taxonomyName,
+            t("insights:insights.explorer.unit_groups"),
+            taxonomy,
+            t,
+          ),
+        );
+      }
+    }
+    return list;
+  }, [allocations, holdings, scopedAccounts, accountValues, t]);
+
+  const active = lenses.find((l) => l.key === activeKey) ?? lenses[0];
+
+  function selectLens(key: string) {
+    setActiveKey(key);
+    setShowAll(false);
+    setExpanded(new Set());
+  }
+
+  function toggle(id: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  if (isLoading) {
+    return (
+      <Card className="space-y-4 p-6">
+        <Skeleton className="h-8 w-72" />
+        <Skeleton className="h-8 w-full" />
+        <Skeleton className="h-40 w-full" />
+      </Card>
+    );
+  }
+
+  const total = sumValue(active.nodes);
+  const collapsible = active.nodes.length > COLLAPSED_TOP_N + 1;
+  const otherLabel = t("insights:insights.explorer.other_units", {
+    count: active.nodes.length - COLLAPSED_TOP_N,
+  });
+  const barWeights = collapsible
+    ? collapseWeights(active.nodes, COLLAPSED_TOP_N, otherLabel)
+    : active.nodes;
+  const listWeights =
+    collapsible && !showAll
+      ? collapseWeights(active.nodes, COLLAPSED_TOP_N, otherLabel)
+      : active.nodes;
+
+  function renderNode(node: BreakdownNode): React.ReactNode[] {
+    const hasChildren = !!node.children?.length;
+    const isOpen = expanded.has(node.id);
+    const isOther = node.id === "__other__";
+    const canOpenSheet = !hasChildren && !isOther && !!active.allocation;
+    const interactive = hasChildren || canOpenSheet;
+    const onActivate = hasChildren
+      ? () => toggle(node.id)
+      : canOpenSheet
+        ? () => {
+            if (active.allocation) onOpenAllocation(active.allocation, node.id);
+          }
+        : undefined;
+
+    const row = (
+      <div
+        key={node.id}
+        className={cn(
+          "flex items-center gap-2 border-t py-2.5 first:border-t-0",
+          interactive &&
+            "hover:bg-muted/60 -mx-1.5 cursor-pointer rounded-lg px-1.5 transition-colors",
+        )}
+        style={{ paddingInlineStart: node.depth ? node.depth * 18 : undefined }}
+        onClick={onActivate}
+        role={interactive ? "button" : undefined}
+        tabIndex={interactive ? 0 : undefined}
+        onKeyDown={
+          interactive
+            ? (e) => {
+                if (e.key === "Enter" || e.key === " ") onActivate?.();
+              }
+            : undefined
+        }
+      >
+        <span className="flex min-w-0 flex-1 items-center gap-2">
+          {hasChildren ? (
+            <Icons.ChevronRight
+              className={cn(
+                "text-muted-foreground h-3.5 w-3.5 shrink-0 transition-transform",
+                isOpen ? "rotate-90" : "rtl:rotate-180",
+              )}
+            />
+          ) : (
+            <span className="w-3.5 shrink-0" />
+          )}
+          <span className="h-3 w-3 shrink-0 rounded-sm" style={{ background: node.color }} />
+          <span
+            className={cn(
+              "truncate text-sm",
+              node.depth ? "text-muted-foreground font-medium" : "text-foreground font-semibold",
+              isOther && "text-muted-foreground font-medium",
+            )}
+          >
+            {node.name}
+          </span>
+        </span>
+        <span className="text-foreground w-15.5 text-end text-sm font-bold tabular-nums">
+          {numbers.formatPercent(node.percentage / 100, { digits: 1 })}
+        </span>
+        <span className="text-muted-foreground w-21 text-end text-xs tabular-nums">
+          <PrivacyAmount value={node.value} currency={currency} />
+        </span>
+        <span className="text-muted-foreground w-3.5 text-center">
+          {canOpenSheet ? <Icons.ChevronRight className="h-3.5 w-3.5 rtl:rotate-180" /> : null}
+        </span>
+      </div>
+    );
+
+    if (hasChildren && isOpen) {
+      return [row, ...(node.children ?? []).flatMap((child) => renderNode(child))];
+    }
+    return [row];
+  }
+
+  return (
+    <div>
+      <Card className="overflow-hidden p-0">
+        {/* Title and lens switcher; narrow cards give the switcher its own row. */}
+        <div className="@container px-6 pt-5 pb-1">
+          <div className="flex flex-col gap-3 @[34rem]:flex-row @[34rem]:items-center @[34rem]:gap-4">
+            <CardTitle className="text-muted-foreground shrink-0 text-sm font-medium tracking-wider uppercase">
+              {t("insights:insights.explorer.breakdown")}
+            </CardTitle>
+            <LensSwitcher
+              lenses={lenses}
+              activeKey={active.key}
+              onSelect={selectLens}
+              aria-label={t("insights:insights.explorer.breakdown")}
+              className="w-full @[34rem]:justify-end"
+            />
+          </div>
+        </div>
+
+        {/* Full-width breakdown */}
+        <div className="p-6">
+          <div className="mb-3.5 flex items-baseline justify-between gap-3.5">
+            <span className="text-sm font-bold">{active.label}</span>
+            <span className="text-muted-foreground text-xs tabular-nums">
+              <PrivacyAmount value={total} currency={currency} /> ·{" "}
+              {active.count ?? active.nodes.length} {active.unit}
+            </span>
+          </div>
+          <SegmentedBar nodes={barWeights} />
+          <div className="mt-4 mb-1 flex items-baseline justify-between">
+            <span className="text-muted-foreground text-2xs font-semibold tracking-wider uppercase">
+              {collapsible && !showAll
+                ? t("insights:insights.explorer.top_units", {
+                    count: COLLAPSED_TOP_N,
+                  })
+                : active.label}
+            </span>
+            {collapsible && (
+              <button
+                type="button"
+                onClick={() => setShowAll((v) => !v)}
+                className="text-muted-foreground hover:text-foreground text-xs font-semibold"
+              >
+                {showAll
+                  ? t("insights:insights.explorer.show_less")
+                  : t("insights:insights.explorer.show_all")}
+              </button>
+            )}
+          </div>
+          <div>{listWeights.flatMap((node) => renderNode(node))}</div>
+        </div>
+      </Card>
+    </div>
+  );
+}

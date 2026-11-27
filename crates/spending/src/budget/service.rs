@@ -1,0 +1,2605 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
+use rust_decimal::Decimal;
+use std::str::FromStr;
+use uuid::Uuid;
+use wealthfolio_core::accounts::{
+    account_supports_purpose, AccountPurpose, AccountRepositoryTrait,
+};
+use wealthfolio_core::activities::{Activity, ActivityRepositoryTrait};
+use wealthfolio_core::taxonomies::{Category, TaxonomyServiceTrait};
+
+use super::model::{
+    BudgetCategoryRow, BudgetGroup, BudgetGroupRow, BudgetRolloverSetting,
+    BudgetRolloverTargetType, BudgetSnapshot, BudgetSnapshotComputed, BudgetSnapshotState,
+    BudgetTarget, BudgetTargetType, BudgetTotals, NewBudgetGroup, NewBudgetGroupAssignment,
+    NewBudgetRolloverSetting, NewBudgetTarget, UpdateBudgetGroup,
+};
+use super::traits::BudgetRepositoryTrait;
+use crate::activity_allocations::{group_assignments, group_splits, SplitsByActivity};
+use crate::activity_assignments::ActivityTaxonomyAssignmentRepositoryTrait;
+use crate::activity_classification::{
+    activity_abs_amount, classify_activity_for_aggregation, decimal_to_f64, neutral_transfer_groups,
+};
+use crate::activity_splits::ActivitySplitRepositoryTrait;
+use crate::category_exclusions::{split_spending_allocations, ExclusionIndex};
+use crate::error::SpendingError;
+use crate::settings::SpendingSettingsService;
+
+const SPENDING_TAXONOMY: &str = "spending_categories";
+const INCOME_TAXONOMY: &str = "income_sources";
+const SAVINGS_TAXONOMY: &str = "savings_categories";
+const DEFAULT_PERIOD_KEY: &str = "default";
+pub const OTHER_GROUP_KEY: &str = "other";
+
+#[derive(Clone, Copy)]
+struct DefaultGroup {
+    id: &'static str,
+    name: &'static str,
+    key: &'static str,
+    color: &'static str,
+    icon: &'static str,
+    sort_order: i32,
+}
+
+struct DefaultAssignment {
+    id: &'static str,
+    category_id: &'static str,
+    group_key: &'static str,
+}
+
+const BUDGET_GROUP_NEEDS_ID: &str = "032ecb02-5912-42e8-9724-2cd566fc08d5";
+const BUDGET_GROUP_WANTS_ID: &str = "a409e0d6-9152-49c8-a5b4-a147a8ac636e";
+const BUDGET_GROUP_SAVINGS_ID: &str = "1fb6f2a3-3245-4702-83e8-ab116458d13e";
+const BUDGET_GROUP_GIVING_ID: &str = "8cbd26c8-e3b2-4176-8c61-e5c11e10b808";
+const BUDGET_GROUP_PERSONAL_ID: &str = "3ff71753-5dd5-4372-9ca2-63d8d9a04851";
+const BUDGET_GROUP_OTHER_ID: &str = "6e25d097-0c73-4521-9407-d47e8dfb73e2";
+
+const DEFAULT_GROUPS: [DefaultGroup; 6] = [
+    DefaultGroup {
+        id: BUDGET_GROUP_NEEDS_ID,
+        name: "Needs",
+        key: "needs",
+        color: "#4F6B92",
+        icon: "Home",
+        sort_order: 1,
+    },
+    DefaultGroup {
+        id: BUDGET_GROUP_WANTS_ID,
+        name: "Wants",
+        key: "wants",
+        color: "#8E7CB3",
+        icon: "Sparkles",
+        sort_order: 2,
+    },
+    DefaultGroup {
+        id: BUDGET_GROUP_SAVINGS_ID,
+        name: "Savings",
+        key: "savings",
+        color: "#6B8E54",
+        icon: "PiggyBank",
+        sort_order: 3,
+    },
+    DefaultGroup {
+        id: BUDGET_GROUP_GIVING_ID,
+        name: "Giving",
+        key: "giving",
+        color: "#A35742",
+        icon: "Gift",
+        sort_order: 4,
+    },
+    DefaultGroup {
+        id: BUDGET_GROUP_PERSONAL_ID,
+        name: "Personal",
+        key: "personal",
+        color: "#B89A4C",
+        icon: "User",
+        sort_order: 5,
+    },
+    DefaultGroup {
+        id: BUDGET_GROUP_OTHER_ID,
+        name: "Other",
+        key: "other",
+        color: "#9C998E",
+        icon: "MoreHorizontal",
+        sort_order: 99,
+    },
+];
+
+const DEFAULT_ASSIGNMENTS: [DefaultAssignment; 15] = [
+    DefaultAssignment {
+        id: "d36f8d92-36f8-4e07-b4b4-9e979ce8a9f4",
+        category_id: "cat_housing",
+        group_key: "needs",
+    },
+    DefaultAssignment {
+        id: "c9a1ef0d-72b2-4f75-858d-5f48e5bc7626",
+        category_id: "cat_groceries",
+        group_key: "needs",
+    },
+    DefaultAssignment {
+        id: "e9543a4c-dead-42f6-9e73-7343e8f43392",
+        category_id: "cat_transport",
+        group_key: "needs",
+    },
+    DefaultAssignment {
+        id: "aa46cdeb-d224-4f3f-9ffb-f6331bafeade",
+        category_id: "cat_health",
+        group_key: "needs",
+    },
+    DefaultAssignment {
+        id: "00769d66-fac3-45e9-9e98-1db5d4447bec",
+        category_id: "cat_bills",
+        group_key: "needs",
+    },
+    DefaultAssignment {
+        id: "9eeaa7b8-aa98-4861-94d3-54650226d9cc",
+        category_id: "cat_fees",
+        group_key: "needs",
+    },
+    DefaultAssignment {
+        id: "5ba8b7fa-bd44-456a-9165-dfdf554bfe10",
+        category_id: "cat_education",
+        group_key: "needs",
+    },
+    DefaultAssignment {
+        id: "2f4bbcbd-8120-4fbe-ab4a-85f7c406e488",
+        category_id: "cat_food",
+        group_key: "wants",
+    },
+    DefaultAssignment {
+        id: "39148a03-c9e9-40e4-867f-5949146b85b8",
+        category_id: "cat_shopping",
+        group_key: "wants",
+    },
+    DefaultAssignment {
+        id: "c2721f07-e7b6-4c74-b449-f138a7d7dabf",
+        category_id: "cat_entertainment",
+        group_key: "wants",
+    },
+    DefaultAssignment {
+        id: "5a2a7585-9f60-4a4b-9cbe-420432720f28",
+        category_id: "cat_travel",
+        group_key: "wants",
+    },
+    DefaultAssignment {
+        id: "d48afe20-18d3-422e-bc26-bd16f4d9d78c",
+        category_id: "cat_gifts",
+        group_key: "giving",
+    },
+    DefaultAssignment {
+        id: "2f46a6a5-dda6-41c7-b372-a0d4f2e571eb",
+        category_id: "cat_savings",
+        group_key: "savings",
+    },
+    DefaultAssignment {
+        id: "dc8d3b07-dbc5-4134-bc31-9f65a7f726bc",
+        category_id: "cat_personal",
+        group_key: "personal",
+    },
+    DefaultAssignment {
+        id: "fb622784-fb8a-497d-8b36-8eb8f347c222",
+        category_id: "cat_other_expense",
+        group_key: "other",
+    },
+];
+
+type MonthActuals = HashMap<(String, String), Decimal>;
+
+/// Category metadata bundled for a single `actuals_by_month` call.
+/// Groups the three taxonomy maps so the method stays under Clippy's
+/// `too_many_arguments` limit.
+struct ActualsMeta<'a> {
+    spending: &'a HashMap<String, Category>,
+    income: &'a HashMap<String, Category>,
+    savings: &'a HashMap<String, Category>,
+}
+
+pub struct BudgetService {
+    repo: Arc<dyn BudgetRepositoryTrait>,
+    activity_repo: Arc<dyn ActivityRepositoryTrait>,
+    account_repo: Arc<dyn AccountRepositoryTrait>,
+    assignment_repo: Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+    split_repo: Arc<dyn ActivitySplitRepositoryTrait>,
+    spending_settings: Arc<SpendingSettingsService>,
+    taxonomy_service: Arc<dyn TaxonomyServiceTrait>,
+    fx_service: Arc<dyn wealthfolio_core::fx::FxServiceTrait>,
+}
+
+impl BudgetService {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repo: Arc<dyn BudgetRepositoryTrait>,
+        activity_repo: Arc<dyn ActivityRepositoryTrait>,
+        account_repo: Arc<dyn AccountRepositoryTrait>,
+        assignment_repo: Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        split_repo: Arc<dyn ActivitySplitRepositoryTrait>,
+        spending_settings: Arc<SpendingSettingsService>,
+        taxonomy_service: Arc<dyn TaxonomyServiceTrait>,
+        fx_service: Arc<dyn wealthfolio_core::fx::FxServiceTrait>,
+    ) -> Self {
+        Self {
+            repo,
+            activity_repo,
+            account_repo,
+            assignment_repo,
+            split_repo,
+            spending_settings,
+            taxonomy_service,
+            fx_service,
+        }
+    }
+
+    pub async fn get(
+        &self,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        self.get_snapshot(period_key, currency, timezone, true)
+            .await
+    }
+
+    /// Agent reads synthesize missing system groups in memory. No seed writes,
+    /// outbox rows or events occur, and the native snapshot calculator is reused.
+    pub async fn get_readonly(
+        &self,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        self.get_snapshot(period_key, currency, timezone, false)
+            .await
+    }
+
+    async fn get_snapshot(
+        &self,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+        initialize_groups: bool,
+    ) -> Result<BudgetSnapshot> {
+        let period_key = normalize_period_key(period_key, timezone)?;
+        let settings = self.spending_settings.get().await?;
+        if !settings.enabled {
+            return Ok(BudgetSnapshot::empty(period_key, currency.to_string()));
+        }
+
+        if initialize_groups {
+            self.ensure_system_groups().await?;
+        }
+        let groups = effective_groups(self.repo.list_groups().await?);
+        let assignments = self.repo.list_group_assignments().await?;
+        let targets = self.repo.list_targets().await?;
+        let rollover_settings = self.repo.list_rollover_settings().await?;
+
+        let spending_categories = self.taxonomy_categories(SPENDING_TAXONOMY)?;
+        let income_categories = self.taxonomy_categories(INCOME_TAXONOMY)?;
+        let savings_categories = self.taxonomy_categories(SAVINGS_TAXONOMY)?;
+        let spending_category_meta = category_meta(&spending_categories);
+        let income_meta = category_meta(&income_categories);
+        let savings_meta = category_meta(&savings_categories);
+        // Excluded categories disappear from the budget snapshot; their
+        // targets/rollover settings persist and reappear on re-include.
+        let exclusions =
+            ExclusionIndex::new(&settings.excluded_category_ids, &spending_category_meta);
+        let mut top_spending_categories = top_level_categories(&spending_categories);
+        top_spending_categories.retain(|c| !exclusions.is_excluded(&c.id));
+        let top_income_categories = top_level_categories(&income_categories);
+
+        let is_month_view = period_key != DEFAULT_PERIOD_KEY;
+        let (actuals_by_month, calculation_quality) = if is_month_view {
+            let earliest_rollover_month = rollover_settings
+                .iter()
+                .filter(|s| s.enabled && s.start_month <= period_key)
+                .map(|s| s.start_month.clone())
+                .min()
+                .unwrap_or_else(|| period_key.clone());
+            self.actuals_by_month(
+                &earliest_rollover_month,
+                &period_key,
+                &ActualsMeta {
+                    spending: &spending_category_meta,
+                    income: &income_meta,
+                    savings: &savings_meta,
+                },
+                currency,
+                timezone,
+            )
+            .await?
+        } else {
+            (HashMap::new(), Default::default())
+        };
+        let current_actuals = actuals_by_month
+            .get(&period_key)
+            .cloned()
+            .unwrap_or_default();
+
+        let target_index = TargetIndex::new(&targets);
+        let rollover_index = RolloverIndex::new(&rollover_settings);
+        let group_by_key: HashMap<String, BudgetGroup> =
+            groups.iter().map(|g| (g.key.clone(), g.clone())).collect();
+        let other_group_id = group_by_key
+            .get(OTHER_GROUP_KEY)
+            .map(|g| g.id.clone())
+            .ok_or_else(|| anyhow!("Missing Other budget group"))?;
+
+        let top_savings_categories = top_level_categories(&savings_categories);
+        let spending_group_of = group_assignment_map(&assignments, SPENDING_TAXONOMY);
+        let savings_group_of = group_assignment_map(&assignments, SAVINGS_TAXONOMY);
+
+        let mut rows_by_group: HashMap<String, Vec<BudgetCategoryRow>> = HashMap::new();
+        for (taxonomy_id, categories, group_of, meta) in [
+            (
+                SPENDING_TAXONOMY,
+                &top_spending_categories,
+                &spending_group_of,
+                &spending_category_meta,
+            ),
+            (
+                SAVINGS_TAXONOMY,
+                &top_savings_categories,
+                &savings_group_of,
+                &savings_meta,
+            ),
+        ] {
+            // A savings target is a goal: `remaining` is what is still to
+            // save, and saving past it is ahead of the goal, not overspent.
+            let is_goal = taxonomy_id == SAVINGS_TAXONOMY;
+            for category in categories {
+                let group_id =
+                    resolve_group_for_category(&category.id, group_of, meta, &other_group_id);
+                let actual = current_actuals
+                    .get(&(taxonomy_id.to_string(), category.id.clone()))
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                let target =
+                    target_index.effective_category_decimal(&period_key, taxonomy_id, &category.id);
+                let rollover = is_month_view
+                    .then(|| rollover_index.category(taxonomy_id, &category.id))
+                    .flatten();
+                let (rollover_in, rollover_out, remaining) = if let Some(setting) = rollover {
+                    compute_rollover_for_month(
+                        setting,
+                        &period_key,
+                        |month| {
+                            target_index.effective_category_decimal(
+                                month,
+                                taxonomy_id,
+                                &category.id,
+                            )
+                        },
+                        |month| {
+                            actuals_by_month
+                                .get(month)
+                                .and_then(|m| {
+                                    m.get(&(taxonomy_id.to_string(), category.id.clone()))
+                                })
+                                .copied()
+                                .unwrap_or(Decimal::ZERO)
+                        },
+                    )
+                } else {
+                    (Decimal::ZERO, Decimal::ZERO, target - actual)
+                };
+                rows_by_group
+                    .entry(group_id.clone())
+                    .or_default()
+                    .push(BudgetCategoryRow {
+                        taxonomy_id: taxonomy_id.to_string(),
+                        category_id: category.id.clone(),
+                        group_id: Some(group_id),
+                        parent_id: category.parent_id.clone(),
+                        name: category.name.clone(),
+                        color: Some(category.color.clone()),
+                        icon: category.icon.clone(),
+                        target: decimal_to_f64(target),
+                        actual: decimal_to_f64(actual),
+                        rollover_in: decimal_to_f64(rollover_in),
+                        rollover_out: decimal_to_f64(rollover_out),
+                        remaining: decimal_to_f64(remaining),
+                        overspent: !is_goal && remaining < Decimal::ZERO,
+                        has_default_target: target_index
+                            .has_default_category(taxonomy_id, &category.id),
+                        has_month_override: target_index.has_month_category(
+                            &period_key,
+                            taxonomy_id,
+                            &category.id,
+                        ),
+                        rollover_enabled: rollover.is_some(),
+                    });
+            }
+        }
+
+        // Sum a set of rows' targets or actuals for one month.
+        let target_total = |rows: &[&BudgetCategoryRow], month: &str| {
+            rows.iter()
+                .map(|row| {
+                    target_index.effective_category_decimal(
+                        month,
+                        &row.taxonomy_id,
+                        &row.category_id,
+                    )
+                })
+                .sum::<Decimal>()
+        };
+        let actual_total = |rows: &[&BudgetCategoryRow], month: &str| {
+            rows.iter()
+                .map(|row| {
+                    actuals_by_month
+                        .get(month)
+                        .and_then(|m| m.get(&(row.taxonomy_id.clone(), row.category_id.clone())))
+                        .copied()
+                        .unwrap_or(Decimal::ZERO)
+                })
+                .sum::<Decimal>()
+        };
+
+        let mut group_rows = Vec::with_capacity(groups.len());
+        let mut spending_planned_total = Decimal::ZERO;
+        let mut spending_actual_total = Decimal::ZERO;
+        let mut spending_remaining_total = Decimal::ZERO;
+        let mut savings_planned_total = Decimal::ZERO;
+        let mut savings_actual_total = Decimal::ZERO;
+        let mut group_buffer_total = Decimal::ZERO;
+        let mut rollover_in_total = Decimal::ZERO;
+        let mut rollover_out_total = Decimal::ZERO;
+        for group in &groups {
+            let mut categories = rows_by_group.remove(&group.id).unwrap_or_default();
+            categories.sort_by(|a, b| a.name.cmp(&b.name));
+            // The group's budget is its consumption: expense rows plus the
+            // buffer. Savings rows listed in it count toward savings instead.
+            let (savings_rows, consumption_rows): (Vec<&BudgetCategoryRow>, Vec<_>) = categories
+                .iter()
+                .partition(|row| row.taxonomy_id == SAVINGS_TAXONOMY);
+            let category_target_total_decimal = target_total(&consumption_rows, &period_key);
+            let actual_decimal = actual_total(&consumption_rows, &period_key);
+            let buffer_decimal =
+                target_index.effective_group_buffer_decimal(&period_key, &group.id);
+            let planned_total_decimal = category_target_total_decimal + buffer_decimal;
+            let rollover = is_month_view
+                .then(|| rollover_index.group(&group.id))
+                .flatten();
+            let (rollover_in, rollover_out, remaining) = if let Some(setting) = rollover {
+                compute_rollover_for_month(
+                    setting,
+                    &period_key,
+                    |month| {
+                        target_total(&consumption_rows, month)
+                            + target_index.effective_group_buffer_decimal(month, &group.id)
+                    },
+                    |month| actual_total(&consumption_rows, month),
+                )
+            } else {
+                (
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    planned_total_decimal - actual_decimal,
+                )
+            };
+            let savings_target_decimal = target_total(&savings_rows, &period_key);
+            let savings_actual_decimal = actual_total(&savings_rows, &period_key);
+            spending_planned_total += planned_total_decimal;
+            spending_actual_total += actual_decimal;
+            spending_remaining_total += remaining;
+            savings_planned_total += savings_target_decimal;
+            savings_actual_total += savings_actual_decimal;
+            group_buffer_total += buffer_decimal;
+            rollover_in_total += rollover_in;
+            rollover_out_total += rollover_out;
+            group_rows.push(BudgetGroupRow {
+                group: group.clone(),
+                category_target_total: decimal_to_f64(category_target_total_decimal),
+                buffer: decimal_to_f64(buffer_decimal),
+                planned_total: decimal_to_f64(planned_total_decimal),
+                actual: decimal_to_f64(actual_decimal),
+                rollover_in: decimal_to_f64(rollover_in),
+                rollover_out: decimal_to_f64(rollover_out),
+                remaining: decimal_to_f64(remaining),
+                overspent: remaining < Decimal::ZERO,
+                rollover_enabled: rollover.is_some(),
+                savings_target_total: decimal_to_f64(savings_target_decimal),
+                savings_actual: decimal_to_f64(savings_actual_decimal),
+                categories,
+            });
+        }
+        group_rows.sort_by(|a, b| {
+            a.group
+                .sort_order
+                .cmp(&b.group.sort_order)
+                .then(a.group.name.cmp(&b.group.name))
+        });
+
+        let mut income_rows = Vec::with_capacity(top_income_categories.len());
+        let mut income_planned_total = Decimal::ZERO;
+        let mut income_actual_total = Decimal::ZERO;
+        for category in &top_income_categories {
+            let actual = current_actuals
+                .get(&(INCOME_TAXONOMY.to_string(), category.id.clone()))
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let target =
+                target_index.effective_category_decimal(&period_key, INCOME_TAXONOMY, &category.id);
+            income_planned_total += target;
+            income_actual_total += actual;
+            income_rows.push(BudgetCategoryRow {
+                taxonomy_id: INCOME_TAXONOMY.to_string(),
+                category_id: category.id.clone(),
+                group_id: None,
+                parent_id: category.parent_id.clone(),
+                name: category.name.clone(),
+                color: Some(category.color.clone()),
+                icon: category.icon.clone(),
+                target: decimal_to_f64(target),
+                actual: decimal_to_f64(actual),
+                rollover_in: 0.0,
+                rollover_out: 0.0,
+                remaining: decimal_to_f64(target - actual),
+                overspent: false,
+                has_default_target: target_index
+                    .has_default_category(INCOME_TAXONOMY, &category.id),
+                has_month_override: target_index.has_month_category(
+                    &period_key,
+                    INCOME_TAXONOMY,
+                    &category.id,
+                ),
+                rollover_enabled: false,
+            });
+        }
+        income_rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let totals = BudgetTotals {
+            spending_planned: decimal_to_f64(spending_planned_total),
+            spending_actual: decimal_to_f64(spending_actual_total),
+            spending_remaining: decimal_to_f64(spending_remaining_total),
+            savings_planned: decimal_to_f64(savings_planned_total),
+            savings_actual: decimal_to_f64(savings_actual_total),
+            income_planned: decimal_to_f64(income_planned_total),
+            income_actual: decimal_to_f64(income_actual_total),
+            group_buffer: decimal_to_f64(group_buffer_total),
+            rollover_in: decimal_to_f64(rollover_in_total),
+            rollover_out: decimal_to_f64(rollover_out_total),
+            overspent_count: group_rows.iter().filter(|g| g.overspent).count()
+                + group_rows
+                    .iter()
+                    .flat_map(|g| &g.categories)
+                    .filter(|c| c.overspent)
+                    .count(),
+        };
+        let fx_as_of = if is_month_view {
+            month_end(&period_key)
+                .ok()
+                .map(|date| date.date_naive().to_string())
+        } else {
+            None
+        };
+
+        Ok(BudgetSnapshot {
+            state: BudgetSnapshotState {
+                groups,
+                group_assignments: assignments,
+                targets,
+                rollover_settings,
+            },
+            computed: BudgetSnapshotComputed {
+                calculation_quality,
+                currency: currency.to_string(),
+                period_key,
+                fx_as_of,
+                group_rows,
+                ungrouped_rows: vec![],
+                income_rows,
+                totals,
+            },
+        })
+    }
+
+    pub async fn create_group(
+        &self,
+        input: NewBudgetGroup,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        self.repo
+            .create_group(NewBudgetGroup {
+                id: input.id,
+                key: Some(format!("custom_{}", Uuid::new_v4())),
+                name: input.name,
+                color: input.color,
+                icon: input.icon,
+                sort_order: input.sort_order,
+                is_system: false,
+            })
+            .await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn update_group(
+        &self,
+        id: &str,
+        patch: UpdateBudgetGroup,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        self.repo.update_group(id, patch).await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn delete_group(
+        &self,
+        id: &str,
+        reassign_to_group_id: &str,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        // The writer validates against current state and resolves assignments in
+        // the same transaction as the delete, so concurrent edits stay authoritative.
+        self.repo
+            .delete_group_and_reassign(id, reassign_to_group_id)
+            .await
+            .map_err(budget_write_error)?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    /// `taxonomy_id` is optional for callers older than savings support, which
+    /// only moved expense categories; it defaults to the expense taxonomy.
+    pub async fn assign_category_to_group(
+        &self,
+        taxonomy_id: Option<String>,
+        category_id: String,
+        group_id: String,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        let taxonomy_id = taxonomy_id.unwrap_or_else(|| SPENDING_TAXONOMY.to_string());
+        self.validate_group_category(&taxonomy_id, &category_id)?;
+        self.repo
+            .upsert_group_assignment(NewBudgetGroupAssignment {
+                id: None,
+                group_id,
+                taxonomy_id,
+                category_id,
+            })
+            .await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn reset_groups(
+        &self,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        self.repo.reset_groups().await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn upsert_target(
+        &self,
+        target: NewBudgetTarget,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        validate_period_key(&target.period_key)?;
+        validate_budget_target(&target)?;
+        self.repo.upsert_target(target).await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn delete_target(
+        &self,
+        id: &str,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        self.repo.delete_target(id).await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn upsert_rollover_setting(
+        &self,
+        setting: NewBudgetRolloverSetting,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        validate_month_key(&setting.start_month)?;
+        validate_rollover_setting(&setting)?;
+        match setting.target_type {
+            BudgetRolloverTargetType::Group if setting.enabled => {
+                let group_id = setting
+                    .group_id
+                    .as_ref()
+                    .ok_or_else(|| invalid_budget_input("Group rollover requires groupId"))?;
+                let categories = self.categories_for_group(group_id).await?;
+                self.repo
+                    .disable_category_rollovers(SPENDING_TAXONOMY, &categories)
+                    .await?;
+            }
+            // Group rollover carries the group's consumption, so only expense
+            // categories give way to it. A savings goal keeps its own rollover.
+            BudgetRolloverTargetType::Category
+                if setting.enabled && setting.taxonomy_id.as_deref() == Some(SPENDING_TAXONOMY) =>
+            {
+                let category_id = setting
+                    .category_id
+                    .as_ref()
+                    .ok_or_else(|| invalid_budget_input("Category rollover requires categoryId"))?;
+                let group_id = self.group_id_for_category(category_id).await?;
+                let group_rollover_enabled = self
+                    .repo
+                    .list_rollover_settings()
+                    .await?
+                    .into_iter()
+                    .any(|r| {
+                        r.enabled
+                            && matches!(r.target_type, BudgetRolloverTargetType::Group)
+                            && r.group_id.as_deref() == Some(group_id.as_str())
+                    });
+                if group_rollover_enabled {
+                    return Err(invalid_budget_input(
+                        "Disable group rollover before enabling category rollover",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        self.repo.upsert_rollover_setting(setting).await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn delete_rollover_setting(
+        &self,
+        id: &str,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        self.repo.delete_rollover_setting(id).await?;
+        self.get(period_key, currency, timezone).await
+    }
+
+    pub async fn copy_period_targets(
+        &self,
+        source_period_key: &str,
+        target_period_key: &str,
+        overwrite: bool,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        validate_period_key(source_period_key)?;
+        validate_month_key(target_period_key)?;
+        if source_period_key == target_period_key {
+            return Err(invalid_budget_input("Source and target months must differ"));
+        }
+        self.repo
+            .copy_period_targets(source_period_key, target_period_key, overwrite)
+            .await?;
+        self.get(Some(target_period_key.to_string()), currency, timezone)
+            .await
+    }
+
+    /// Prepare against the same pure snapshot exposed by get_budget. This is
+    /// transient evidence; no draft row, seeding, event or outbox write occurs.
+    pub async fn prepare_change(
+        &self,
+        mut operation: super::model::BudgetOperation,
+        period_key: Option<String>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<super::model::BudgetReview> {
+        let snapshot = self.get_readonly(period_key, currency, timezone).await?;
+        if snapshot.state.groups.is_empty() {
+            return Err(invalid_budget_input(
+                "Enable Spending before editing budgets",
+            ));
+        }
+        if let super::model::BudgetOperation::CreateGroup { group } = &mut operation {
+            group.id = Some(
+                group
+                    .id
+                    .take()
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            );
+            group.key = Some(format!(
+                "custom_{}",
+                group.id.as_deref().expect("assigned id")
+            ));
+            group.is_system = false;
+        }
+        self.validate_operation(&operation, &snapshot.state).await?;
+        Ok(super::model::BudgetReview {
+            expected: snapshot.state,
+            operation,
+            period_key: snapshot.computed.period_key,
+            currency: currency.into(),
+        })
+    }
+
+    pub async fn commit_change(
+        &self,
+        review: super::model::BudgetReview,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<BudgetSnapshot> {
+        if review.currency != currency {
+            return Err(invalid_budget_input("Budget currency changed since review"));
+        }
+        validate_period_key(&review.period_key)?;
+        if !self.spending_settings.get().await?.enabled {
+            return Err(invalid_budget_input("Spending is disabled"));
+        }
+        self.validate_operation(&review.operation, &review.expected)
+            .await?;
+        self.repo
+            .apply_reviewed(review.expected, review.operation)
+            .await
+            .map_err(budget_write_error)?;
+        self.get_readonly(Some(review.period_key), currency, timezone)
+            .await
+    }
+
+    async fn validate_operation(
+        &self,
+        operation: &super::model::BudgetOperation,
+        state: &BudgetSnapshotState,
+    ) -> Result<()> {
+        use super::model::BudgetOperation::*;
+        let has_group = |id: &str| state.groups.iter().any(|g| g.id == id);
+        let category = |taxonomy: &str, id: &str| -> Result<()> {
+            if ![SPENDING_TAXONOMY, INCOME_TAXONOMY, SAVINGS_TAXONOMY].contains(&taxonomy) {
+                return Err(invalid_budget_input(
+                    "Budget targets currently support expense, savings, and income categories",
+                ));
+            }
+            if !self
+                .taxonomy_categories(taxonomy)?
+                .iter()
+                .any(|c| c.id == id && c.parent_id.is_none())
+            {
+                return Err(invalid_budget_input(
+                    "Select a top-level category in the target taxonomy",
+                ));
+            }
+            Ok(())
+        };
+        match operation {
+            SetTarget { target } => {
+                validate_period_key(&target.period_key)?;
+                validate_budget_target(target)?;
+                if target
+                    .amount
+                    .parse::<Decimal>()
+                    .map_or(true, |n| n < Decimal::ZERO)
+                {
+                    return Err(invalid_budget_input(
+                        "Target amount must be a nonnegative decimal",
+                    ));
+                }
+                match target.target_type {
+                    BudgetTargetType::Category => category(
+                        target.taxonomy_id.as_deref().unwrap_or(""),
+                        target.category_id.as_deref().unwrap_or(""),
+                    )?,
+                    BudgetTargetType::GroupBuffer => {
+                        if !has_group(target.group_id.as_deref().unwrap_or("")) {
+                            return Err(invalid_budget_input("Budget group not found"));
+                        }
+                    }
+                }
+            }
+            RemoveTarget { id } => {
+                if !state.targets.iter().any(|t| t.id == *id) {
+                    return Err(invalid_budget_input("Budget target not found"));
+                }
+            }
+            CopyTargets {
+                source_period_key,
+                target_period_key,
+                ..
+            } => {
+                validate_period_key(source_period_key)?;
+                validate_month_key(target_period_key)?;
+                if source_period_key == target_period_key {
+                    return Err(invalid_budget_input("Source and destination must differ"));
+                }
+            }
+            CreateGroup { group } => {
+                if group.is_system
+                    || group
+                        .id
+                        .as_deref()
+                        .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+                    || group.name.trim().is_empty()
+                    || state
+                        .groups
+                        .iter()
+                        .any(|g| Some(g.id.as_str()) == group.id.as_deref())
+                {
+                    return Err(invalid_budget_input(
+                        "Provide a new custom group with a nonempty name",
+                    ));
+                }
+            }
+            UpdateGroup { id, changes } => {
+                if !has_group(id) || changes.name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+                    return Err(invalid_budget_input(
+                        "Provide an existing group and a nonempty name",
+                    ));
+                }
+            }
+            DeleteGroup {
+                id,
+                reassign_to_group_id,
+            } => {
+                validate_group_deletion(state, id, reassign_to_group_id)?;
+            }
+            AssignCategory {
+                taxonomy_id,
+                category_id,
+                group_id,
+            } => {
+                self.validate_group_category(taxonomy_id, category_id)?;
+                if !has_group(group_id) {
+                    return Err(invalid_budget_input("Budget group not found"));
+                }
+            }
+            SetRollover { setting } => {
+                validate_month_key(&setting.start_month)?;
+                validate_rollover_setting(setting)?;
+                match setting.target_type {
+                    BudgetRolloverTargetType::Category => {
+                        let tax_id = setting.taxonomy_id.as_deref().unwrap_or("");
+                        let cat_id = setting.category_id.as_deref().unwrap_or("");
+                        category(tax_id, cat_id)?;
+                        // As in `upsert_rollover_setting`: only expense
+                        // categories give way to their group's rollover.
+                        if setting.enabled && tax_id == SPENDING_TAXONOMY {
+                            let group_id = state
+                                .group_assignments
+                                .iter()
+                                .find(|a| a.taxonomy_id == tax_id && a.category_id == cat_id)
+                                .map(|a| a.group_id.clone())
+                                .or_else(|| {
+                                    state
+                                        .groups
+                                        .iter()
+                                        .find(|g| g.key == OTHER_GROUP_KEY)
+                                        .map(|g| g.id.clone())
+                                })
+                                .ok_or_else(|| {
+                                    invalid_budget_input("Missing Other budget group")
+                                })?;
+                            if state.rollover_settings.iter().any(|r| {
+                                r.enabled
+                                    && matches!(r.target_type, BudgetRolloverTargetType::Group)
+                                    && r.group_id.as_deref() == Some(group_id.as_str())
+                            }) {
+                                return Err(invalid_budget_input(
+                                    "Disable group rollover before enabling category rollover",
+                                ));
+                            }
+                        }
+                    }
+                    BudgetRolloverTargetType::Group => {
+                        if !has_group(setting.group_id.as_deref().unwrap_or("")) {
+                            return Err(invalid_budget_input("Budget group not found"));
+                        }
+                    }
+                }
+            }
+            RemoveRollover { id } => {
+                if !state.rollover_settings.iter().any(|r| r.id == *id) {
+                    return Err(invalid_budget_input("Rollover setting not found"));
+                }
+            }
+            ResetGroups => (),
+        }
+        Ok(())
+    }
+
+    async fn ensure_system_groups(&self) -> Result<()> {
+        let existing_keys: HashSet<String> = self
+            .repo
+            .list_groups()
+            .await?
+            .into_iter()
+            .map(|g| g.key)
+            .collect();
+        let missing = default_group_inputs()
+            .into_iter()
+            .filter(|g| {
+                g.key.as_deref() == Some(OTHER_GROUP_KEY)
+                    && !existing_keys.contains(OTHER_GROUP_KEY)
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.repo.upsert_system_groups(missing).await?;
+        }
+        Ok(())
+    }
+
+    /// Budget groups list top-level expense and savings categories.
+    fn validate_group_category(&self, taxonomy_id: &str, category_id: &str) -> Result<()> {
+        if ![SPENDING_TAXONOMY, SAVINGS_TAXONOMY].contains(&taxonomy_id)
+            || !self
+                .taxonomy_categories(taxonomy_id)?
+                .iter()
+                .any(|c| c.id == category_id && c.parent_id.is_none())
+        {
+            return Err(invalid_budget_input(
+                "Select a top-level expense or savings category",
+            ));
+        }
+        Ok(())
+    }
+
+    fn taxonomy_categories(&self, taxonomy_id: &str) -> Result<Vec<Category>> {
+        Ok(self
+            .taxonomy_service
+            .get_taxonomy(taxonomy_id)?
+            .map(|t| t.categories)
+            .unwrap_or_default())
+    }
+
+    /// Top-level expense categories that resolve to the group.
+    async fn categories_for_group(&self, group_id: &str) -> Result<Vec<String>> {
+        let assignments = self.repo.list_group_assignments().await?;
+        let categories = self.taxonomy_categories(SPENDING_TAXONOMY)?;
+        let meta = category_meta(&categories);
+        let other_group_id = self.other_group_id().await?;
+        let group_of = group_assignment_map(&assignments, SPENDING_TAXONOMY);
+        Ok(top_level_categories(&categories)
+            .into_iter()
+            .filter(|category| {
+                resolve_group_for_category(&category.id, &group_of, &meta, &other_group_id)
+                    == group_id
+            })
+            .map(|category| category.id)
+            .collect())
+    }
+
+    /// Group of an expense category.
+    async fn group_id_for_category(&self, category_id: &str) -> Result<String> {
+        let assignments = self.repo.list_group_assignments().await?;
+        let categories = self.taxonomy_categories(SPENDING_TAXONOMY)?;
+        let meta = category_meta(&categories);
+        let other_group_id = self.other_group_id().await?;
+        let group_of = group_assignment_map(&assignments, SPENDING_TAXONOMY);
+        Ok(resolve_group_for_category(
+            category_id,
+            &group_of,
+            &meta,
+            &other_group_id,
+        ))
+    }
+
+    async fn other_group_id(&self) -> Result<String> {
+        self.repo
+            .list_groups()
+            .await?
+            .into_iter()
+            .find(|g| g.key == OTHER_GROUP_KEY)
+            .map(|g| g.id)
+            .ok_or_else(|| anyhow!("Missing Other budget group"))
+    }
+
+    /// `currency` is the FX target — every counted activity is converted to
+    /// it at `end_period`'s month-end (snapshot-date convention, matches
+    /// insight + monthly_report so per-month actuals reconcile with the
+    /// broader dashboard numbers).
+    /// `timezone` (IANA name, may be empty) drives per-month bucketing so a
+    /// midnight-local activity on the first/last day of a month lands in the
+    /// month the user perceives, not the UTC month.
+    async fn actuals_by_month(
+        &self,
+        start_period: &str,
+        end_period: &str,
+        meta: &ActualsMeta<'_>,
+        currency: &str,
+        timezone: &str,
+    ) -> Result<(HashMap<String, MonthActuals>, crate::CalculationQuality)> {
+        let settings = self.spending_settings.get().await?;
+        if !settings.enabled || settings.account_ids.is_empty() {
+            return Ok((HashMap::new(), Default::default()));
+        }
+        let accounts = self
+            .account_repo
+            .list(None, Some(false), Some(&settings.account_ids))
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let account_types: HashMap<String, String> = accounts
+            .into_iter()
+            .filter(|a| account_supports_purpose(&a.account_type, AccountPurpose::Spending))
+            .map(|a| (a.id, a.account_type))
+            .collect();
+        if account_types.is_empty() {
+            return Ok((HashMap::new(), Default::default()));
+        }
+        let account_ids = account_types.keys().cloned().collect::<Vec<_>>();
+        let (start, _) = local_month_bounds_utc(start_period, timezone)?;
+        let (_, end) = local_month_bounds_utc(end_period, timezone)?;
+
+        let activities = self
+            .activity_repo
+            .get_activities_by_account_ids_in_date_range(&account_ids, start, end)
+            .map_err(|e| anyhow!(e.to_string()))?;
+        // A transfer between two spending accounts is internal even when its
+        // other leg falls outside the window, so read every leg of the linked
+        // transfers in it and keep those in the spending accounts.
+        let transfer_group_ids: Vec<String> = activities
+            .iter()
+            .filter(|a| matches!(a.effective_type(), "TRANSFER_IN" | "TRANSFER_OUT"))
+            .filter_map(|a| a.source_group_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let transfer_legs = self
+            .activity_repo
+            .get_activities_by_source_group_ids(&transfer_group_ids)
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let spending_legs: Vec<&Activity> = transfer_legs
+            .iter()
+            .filter(|a| account_types.contains_key(&a.account_id))
+            .collect();
+        // Match reports and cash-flow validation: linked debt balance transfers
+        // stay neutral even if the other liability is outside Spending or archived.
+        // The linked legs supply context only; actuals still use the window above.
+        let transfer_groups = neutral_transfer_groups(
+            &spending_legs,
+            &account_types,
+            self.activity_repo.as_ref(),
+            self.account_repo.as_ref(),
+        )?;
+        let activity_ids = activities.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+        let assignments = self
+            .assignment_repo
+            .list_for_activities(&activity_ids)
+            .await?;
+        let assignments_by_activity = group_assignments(assignments);
+        let splits_by_activity =
+            group_splits(self.split_repo.list_for_activities(&activity_ids).await?);
+
+        // FX: one as_of date for the entire window (end of the latest month
+        // covered). Mirrors net_worth / insight snapshot convention so all
+        // months in this window get the same rate per pair.
+        let fx_as_of = local_month_end_date(end_period, timezone)?;
+        let fx = self.fx_service.as_ref();
+        // Excluded spending categories leave budget actuals (and, via the
+        // filter in `get`, the snapshot rows); income actuals never filter.
+        let exclusions = ExclusionIndex::new(&settings.excluded_category_ids, meta.spending);
+        let no_exclusions = ExclusionIndex::empty();
+        let mut calculation_quality = crate::CalculationQuality::default();
+        let mut actuals: HashMap<String, MonthActuals> = HashMap::new();
+        for activity in activities {
+            let Some(account_type) = account_types.get(&activity.account_id) else {
+                continue;
+            };
+            let classification =
+                classify_activity_for_aggregation(&activity, account_type, &transfer_groups);
+            let amount = activity_abs_amount(&activity);
+            let spending_native = classification.spending_amount(amount);
+            let income_native = classification.income_amount(amount);
+            // A savings goal counts money moved to savings. Money brought back
+            // is one uncategorized "from savings" figure, as in the report, so
+            // it never lowers a goal.
+            let saving_native = classification.saving_amount(amount);
+            if spending_native == Decimal::ZERO
+                && income_native == Decimal::ZERO
+                && saving_native == Decimal::ZERO
+            {
+                continue;
+            }
+            // Bucket by user-local month so a midnight-local activity on
+            // month boundaries lands in the month the user perceives,
+            // mirroring insight::compute_by_month.
+            let month = period_key_for_date_in_tz(activity.activity_date, timezone);
+            let month_actuals = actuals.entry(month).or_default();
+            let spending_missing = add_allocated_actuals(
+                month_actuals,
+                &activity.id,
+                SPENDING_TAXONOMY,
+                spending_native,
+                meta.spending,
+                &assignments_by_activity,
+                &splits_by_activity,
+                &exclusions,
+                fx,
+                &activity.currency,
+                currency,
+                fx_as_of,
+            );
+            let income_missing = add_allocated_actuals(
+                month_actuals,
+                &activity.id,
+                INCOME_TAXONOMY,
+                income_native,
+                meta.income,
+                &assignments_by_activity,
+                &splits_by_activity,
+                &no_exclusions,
+                fx,
+                &activity.currency,
+                currency,
+                fx_as_of,
+            );
+            let savings_missing = add_allocated_actuals(
+                month_actuals,
+                &activity.id,
+                SAVINGS_TAXONOMY,
+                saving_native,
+                meta.savings,
+                &assignments_by_activity,
+                &splits_by_activity,
+                &no_exclusions,
+                fx,
+                &activity.currency,
+                currency,
+                fx_as_of,
+            );
+            if spending_missing || income_missing || savings_missing {
+                calculation_quality.record_missing(&activity.currency);
+            }
+        }
+        Ok((actuals, calculation_quality))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_allocated_actuals(
+    month_actuals: &mut MonthActuals,
+    activity_id: &str,
+    taxonomy_id: &str,
+    amount: Decimal,
+    meta: &HashMap<String, Category>,
+    assignments_by_activity: &crate::activity_allocations::AssignmentsByActivity,
+    splits_by_activity: &SplitsByActivity,
+    exclusions: &ExclusionIndex,
+    fx: &dyn wealthfolio_core::fx::FxServiceTrait,
+    from_currency: &str,
+    target_currency: &str,
+    fx_as_of: NaiveDate,
+) -> bool {
+    // Filter before the top_category_id rollup — an excluded subcategory must
+    // not roll its spend into an included parent.
+    let (allocations, _excluded_native) = split_spending_allocations(
+        activity_id,
+        taxonomy_id,
+        amount,
+        assignments_by_activity,
+        splits_by_activity,
+        exclusions,
+    );
+    let mut missing = false;
+    for allocation in allocations {
+        let amount = crate::fx::convert(
+            fx,
+            allocation.amount,
+            from_currency,
+            target_currency,
+            fx_as_of,
+        );
+        missing |= amount.is_none();
+        let amount = amount.unwrap_or(Decimal::ZERO);
+        if amount == Decimal::ZERO {
+            continue;
+        }
+        let top_id = top_category_id(&allocation.category_id, meta);
+        *month_actuals
+            .entry((taxonomy_id.to_string(), top_id))
+            .or_insert(Decimal::ZERO) += amount;
+    }
+    missing
+}
+
+pub(crate) struct TargetIndex<'a> {
+    targets: &'a [BudgetTarget],
+}
+
+impl<'a> TargetIndex<'a> {
+    pub(crate) fn new(targets: &'a [BudgetTarget]) -> Self {
+        Self { targets }
+    }
+
+    pub(crate) fn effective_category_decimal(
+        &self,
+        period: &str,
+        taxonomy_id: &str,
+        category_id: &str,
+    ) -> Decimal {
+        self.month_category(period, taxonomy_id, category_id)
+            .or_else(|| self.default_category(taxonomy_id, category_id))
+            .map(parse_amount)
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub(crate) fn effective_group_buffer_decimal(&self, period: &str, group_id: &str) -> Decimal {
+        self.month_group_buffer(period, group_id)
+            .or_else(|| self.default_group_buffer(group_id))
+            .map(parse_amount)
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub(crate) fn has_default_category(&self, taxonomy_id: &str, category_id: &str) -> bool {
+        self.default_category(taxonomy_id, category_id).is_some()
+    }
+
+    pub(crate) fn has_month_category(
+        &self,
+        period: &str,
+        taxonomy_id: &str,
+        category_id: &str,
+    ) -> bool {
+        self.month_category(period, taxonomy_id, category_id)
+            .is_some()
+    }
+
+    pub(crate) fn has_month_group_buffer(&self, period: &str, group_id: &str) -> bool {
+        self.month_group_buffer(period, group_id).is_some()
+    }
+
+    fn month_category(&self, period: &str, taxonomy_id: &str, category_id: &str) -> Option<&str> {
+        self.targets
+            .iter()
+            .find(|t| {
+                matches!(t.target_type, BudgetTargetType::Category)
+                    && t.period_key == period
+                    && t.taxonomy_id.as_deref() == Some(taxonomy_id)
+                    && t.category_id.as_deref() == Some(category_id)
+            })
+            .map(|t| t.amount.as_str())
+    }
+
+    fn default_category(&self, taxonomy_id: &str, category_id: &str) -> Option<&str> {
+        self.month_category(DEFAULT_PERIOD_KEY, taxonomy_id, category_id)
+    }
+
+    fn month_group_buffer(&self, period: &str, group_id: &str) -> Option<&str> {
+        self.targets
+            .iter()
+            .find(|t| {
+                matches!(t.target_type, BudgetTargetType::GroupBuffer)
+                    && t.period_key == period
+                    && t.group_id.as_deref() == Some(group_id)
+            })
+            .map(|t| t.amount.as_str())
+    }
+
+    fn default_group_buffer(&self, group_id: &str) -> Option<&str> {
+        self.month_group_buffer(DEFAULT_PERIOD_KEY, group_id)
+    }
+}
+
+struct RolloverIndex<'a> {
+    settings: &'a [BudgetRolloverSetting],
+}
+
+impl<'a> RolloverIndex<'a> {
+    fn new(settings: &'a [BudgetRolloverSetting]) -> Self {
+        Self { settings }
+    }
+
+    fn category(&self, taxonomy_id: &str, category_id: &str) -> Option<&'a BudgetRolloverSetting> {
+        self.settings.iter().find(|s| {
+            s.enabled
+                && matches!(s.target_type, BudgetRolloverTargetType::Category)
+                && s.taxonomy_id.as_deref() == Some(taxonomy_id)
+                && s.category_id.as_deref() == Some(category_id)
+        })
+    }
+
+    fn group(&self, group_id: &str) -> Option<&'a BudgetRolloverSetting> {
+        self.settings.iter().find(|s| {
+            s.enabled
+                && matches!(s.target_type, BudgetRolloverTargetType::Group)
+                && s.group_id.as_deref() == Some(group_id)
+        })
+    }
+}
+
+fn compute_rollover_for_month(
+    setting: &BudgetRolloverSetting,
+    period_key: &str,
+    target_for_month: impl Fn(&str) -> Decimal,
+    actual_for_month: impl Fn(&str) -> Decimal,
+) -> (Decimal, Decimal, Decimal) {
+    if setting.start_month.as_str() > period_key {
+        let target = target_for_month(period_key);
+        let actual = actual_for_month(period_key);
+        return (Decimal::ZERO, Decimal::ZERO, target - actual);
+    }
+    let mut carry = parse_amount(&setting.starting_balance);
+    for month in month_keys_between(&setting.start_month, period_key) {
+        let rollover_in = carry;
+        let target = target_for_month(&month);
+        let actual = actual_for_month(&month);
+        let rollover_out = rollover_in + target - actual;
+        if month == period_key {
+            return (rollover_in, rollover_out, rollover_in + target - actual);
+        }
+        carry = rollover_out;
+    }
+    (
+        Decimal::ZERO,
+        Decimal::ZERO,
+        target_for_month(period_key) - actual_for_month(period_key),
+    )
+}
+
+/// One pure default resolution for Budget and Insight. Persisted user edits and
+/// custom groups remain authoritative; synthesize only the required Other group.
+/// Optional defaults are seeded by migrations and restored only by explicit Reset.
+/// Epoch timestamps identify definitions without pretending a read persisted them.
+pub fn effective_groups(mut groups: Vec<BudgetGroup>) -> Vec<BudgetGroup> {
+    for default in DEFAULT_GROUPS
+        .into_iter()
+        .filter(|g| g.key == OTHER_GROUP_KEY)
+    {
+        if groups
+            .iter()
+            .any(|group| group.key == default.key || group.id == default.id)
+        {
+            continue;
+        }
+        groups.push(BudgetGroup {
+            id: default.id.to_string(),
+            name: default.name.to_string(),
+            key: default.key.to_string(),
+            color: Some(default.color.to_string()),
+            icon: Some(default.icon.to_string()),
+            sort_order: default.sort_order,
+            is_system: true,
+            created_at: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+            updated_at: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+        });
+    }
+    groups
+}
+
+/// Shared deletion policy for review validation and the storage writer's current
+/// state. An enabled destination rollover would recompute carry using the moved
+/// group's history, changing remaining amounts even when monthly targets match.
+pub fn validate_group_deletion(
+    state: &BudgetSnapshotState,
+    id: &str,
+    destination: &str,
+) -> Result<()> {
+    let source = state
+        .groups
+        .iter()
+        .find(|g| g.id == id)
+        .ok_or_else(|| invalid_budget_input("Budget group not found"))?;
+    if source.key == OTHER_GROUP_KEY || source.id == BUDGET_GROUP_OTHER_ID {
+        return Err(invalid_budget_input(
+            "Other is the required fallback budget group and cannot be deleted",
+        ));
+    }
+    if id == destination || !state.groups.iter().any(|g| g.id == destination) {
+        return Err(invalid_budget_input(
+            "Select a different existing destination budget group",
+        ));
+    }
+    for setting in &state.rollover_settings {
+        if !matches!(setting.target_type, BudgetRolloverTargetType::Group) {
+            continue;
+        }
+        if setting.group_id.as_deref() == Some(id) {
+            return Err(invalid_budget_input(
+                "Remove the group's rollover setting before deleting it",
+            ));
+        }
+        if setting.enabled && setting.group_id.as_deref() == Some(destination) {
+            return Err(invalid_budget_input(
+                "Disable destination group rollover before moving budgets into it",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Monthly rows replace defaults. Preserve their effective sum at the union of
+/// override months, including explicit zeroes, and the sum of the defaults for
+/// every other month. Category targets and category rollover are independent.
+pub fn merged_group_buffers(
+    targets: &[BudgetTarget],
+    source: &str,
+    destination: &str,
+) -> Result<Vec<NewBudgetTarget>> {
+    let buffers = targets
+        .iter()
+        .filter(|t| {
+            matches!(t.target_type, BudgetTargetType::GroupBuffer)
+                && matches!(t.group_id.as_deref(), Some(id) if id == source || id == destination)
+        })
+        .collect::<Vec<_>>();
+    if !buffers
+        .iter()
+        .any(|t| t.group_id.as_deref() == Some(source))
+    {
+        return Ok(Vec::new());
+    }
+    merge_effective_amounts(
+        buffers.into_iter().map(|t| {
+            (
+                t.group_id.as_deref().unwrap_or_default(),
+                t.period_key.as_str(),
+                t.amount.as_str(),
+            )
+        }),
+        source,
+        destination,
+    )?
+    .into_iter()
+    .map(|(period_key, amount)| {
+        Ok(NewBudgetTarget {
+            id: None,
+            period_key,
+            target_type: BudgetTargetType::GroupBuffer,
+            taxonomy_id: None,
+            category_id: None,
+            group_id: Some(destination.to_string()),
+            amount,
+        })
+    })
+    .collect()
+}
+
+/// Shared by group-buffer and category merges. Overrides replace defaults;
+/// amounts must remain exactly representable in every affected month.
+pub(crate) fn merge_effective_amounts<'a>(
+    rows: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+    source: &str,
+    destination: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut amounts = HashMap::new();
+    let mut periods = std::collections::BTreeSet::new();
+    for (owner, period, value) in rows {
+        let amount = Decimal::from_str_exact(value)
+            .map_err(|_| invalid_budget_input("Invalid budget amount"))?;
+        amounts.insert((owner, period), amount);
+        periods.insert(period);
+    }
+    let effective = |owner, period| {
+        amounts
+            .get(&(owner, period))
+            .or_else(|| amounts.get(&(owner, DEFAULT_PERIOD_KEY)))
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+    };
+    periods
+        .into_iter()
+        .map(|period| {
+            let source_amount = effective(source, period);
+            let destination_amount = effective(destination, period);
+            let amount = source_amount
+                .checked_add(destination_amount)
+                // Decimal addition can reduce scale to fit its coefficient.
+                // Both inputs must remain exactly recoverable from the sum.
+                .filter(|sum| {
+                    sum.checked_sub(source_amount) == Some(destination_amount)
+                        && sum.checked_sub(destination_amount) == Some(source_amount)
+                })
+                .ok_or_else(|| {
+                    invalid_budget_input("Merged budget amount cannot be represented exactly")
+                })?;
+            Ok((period.to_string(), amount.normalize().to_string()))
+        })
+        .collect()
+}
+
+/// Explicit Reset can restore these seeded identities after deletion. Custom
+/// group UUIDs remain one-time identities for sync conflict resolution.
+pub fn is_default_group_id(id: &str) -> bool {
+    DEFAULT_GROUPS.iter().any(|group| group.id == id)
+}
+
+pub fn default_group_inputs() -> Vec<NewBudgetGroup> {
+    DEFAULT_GROUPS
+        .iter()
+        .map(|g| NewBudgetGroup {
+            id: Some(g.id.to_string()),
+            name: g.name.to_string(),
+            key: Some(g.key.to_string()),
+            color: Some(g.color.to_string()),
+            icon: Some(g.icon.to_string()),
+            sort_order: Some(g.sort_order),
+            is_system: true,
+        })
+        .collect()
+}
+
+pub fn default_assignment_inputs(
+    group_by_key: &HashMap<String, String>,
+) -> Vec<NewBudgetGroupAssignment> {
+    DEFAULT_ASSIGNMENTS
+        .iter()
+        .filter_map(|assignment| {
+            group_by_key
+                .get(assignment.group_key)
+                .map(|group_id| NewBudgetGroupAssignment {
+                    id: Some(assignment.id.to_string()),
+                    group_id: group_id.clone(),
+                    taxonomy_id: if assignment.category_id == "cat_savings" {
+                        SAVINGS_TAXONOMY
+                    } else {
+                        SPENDING_TAXONOMY
+                    }
+                    .to_string(),
+                    category_id: assignment.category_id.to_string(),
+                })
+        })
+        .collect()
+}
+
+pub(crate) fn category_meta(categories: &[Category]) -> HashMap<String, Category> {
+    categories
+        .iter()
+        .map(|c| (c.id.clone(), c.clone()))
+        .collect()
+}
+
+pub(crate) fn top_level_categories(categories: &[Category]) -> Vec<Category> {
+    let mut categories = categories
+        .iter()
+        .filter(|c| c.parent_id.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    categories.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.name.cmp(&b.name)));
+    categories
+}
+
+/// Category id → group id for one taxonomy's assignments. Categories are
+/// identified by (taxonomy, id), so each taxonomy resolves on its own.
+pub(crate) fn group_assignment_map(
+    assignments: &[super::model::BudgetGroupAssignment],
+    taxonomy_id: &str,
+) -> HashMap<String, String> {
+    assignments
+        .iter()
+        .filter(|a| a.taxonomy_id == taxonomy_id)
+        .map(|a| (a.category_id.clone(), a.group_id.clone()))
+        .collect()
+}
+
+pub(crate) fn resolve_group_for_category(
+    category_id: &str,
+    assignment_by_category: &HashMap<String, String>,
+    category_meta: &HashMap<String, Category>,
+    other_group_id: &str,
+) -> String {
+    let mut current = Some(category_id.to_string());
+    while let Some(id) = current {
+        if let Some(group_id) = assignment_by_category.get(&id) {
+            return group_id.clone();
+        }
+        current = category_meta.get(&id).and_then(|c| c.parent_id.clone());
+    }
+    other_group_id.to_string()
+}
+
+pub(crate) fn top_category_id(category_id: &str, meta: &HashMap<String, Category>) -> String {
+    let mut current = category_id.to_string();
+    // Guard against a corrupted taxonomy with a cyclic parent_id chain: bound
+    // the walk to a depth far above any realistic hierarchy depth (the seeded
+    // taxonomies are 2 levels deep). Without the bound, a `parent_id` loop
+    // would hang the entire request thread.
+    const MAX_DEPTH: usize = 32;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(current.clone());
+    for _ in 0..MAX_DEPTH {
+        match meta.get(&current).and_then(|c| c.parent_id.clone()) {
+            Some(parent_id) if !seen.contains(&parent_id) => {
+                seen.insert(parent_id.clone());
+                current = parent_id;
+            }
+            _ => break,
+        }
+    }
+    current
+}
+
+/// Parse a string-encoded decimal amount. Garbage input degrades to
+/// 0.0 (callers treat that as "no budget set"), but log a warning so a
+/// corrupted row is at least visible in operator logs.
+fn parse_amount(value: &str) -> Decimal {
+    match Decimal::from_str(value) {
+        Ok(n) => n,
+        Err(_) => {
+            log::warn!(
+                "budget parse_amount: ignoring non-numeric amount {:?} (treating as 0.0)",
+                value
+            );
+            Decimal::ZERO
+        }
+    }
+}
+
+fn validate_decimal_amount(value: &str, field_name: &str) -> Result<()> {
+    Decimal::from_str(value)
+        .map(|_| ())
+        .map_err(|_| invalid_budget_input(&format!("Invalid {field_name} amount")))
+}
+
+fn normalize_period_key(period_key: Option<String>, timezone: &str) -> Result<String> {
+    match period_key {
+        Some(key) if key == DEFAULT_PERIOD_KEY => Ok(key),
+        Some(key) => {
+            validate_month_key(&key)?;
+            Ok(key)
+        }
+        None => Ok(period_key_for_date_in_tz(Utc::now(), timezone)),
+    }
+}
+
+pub(crate) fn validate_period_key(period_key: &str) -> Result<()> {
+    if period_key == DEFAULT_PERIOD_KEY {
+        Ok(())
+    } else {
+        validate_month_key(period_key)
+    }
+}
+
+fn validate_budget_target(target: &NewBudgetTarget) -> Result<()> {
+    validate_decimal_amount(&target.amount, "budget target")?;
+
+    match target.target_type {
+        BudgetTargetType::Category => {
+            if target.taxonomy_id.as_deref().unwrap_or_default().is_empty()
+                || target.category_id.as_deref().unwrap_or_default().is_empty()
+                || target.group_id.is_some()
+            {
+                return Err(invalid_budget_input(
+                    "Category target requires taxonomyId and categoryId only",
+                ));
+            }
+        }
+        BudgetTargetType::GroupBuffer => {
+            if target.group_id.as_deref().unwrap_or_default().is_empty()
+                || target.taxonomy_id.is_some()
+                || target.category_id.is_some()
+            {
+                return Err(invalid_budget_input(
+                    "Group buffer target requires groupId only",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rollover_setting(setting: &NewBudgetRolloverSetting) -> Result<()> {
+    validate_decimal_amount(&setting.starting_balance, "rollover starting balance")?;
+
+    match setting.target_type {
+        BudgetRolloverTargetType::Category => {
+            let valid_taxonomy = matches!(
+                setting.taxonomy_id.as_deref(),
+                Some(SPENDING_TAXONOMY) | Some(SAVINGS_TAXONOMY)
+            );
+            if !valid_taxonomy
+                || setting
+                    .category_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                || setting.group_id.is_some()
+            {
+                return Err(invalid_budget_input(
+                    "Category rollover requires a spending or savings taxonomyId and categoryId only",
+                ));
+            }
+        }
+        BudgetRolloverTargetType::Group => {
+            if setting.group_id.as_deref().unwrap_or_default().is_empty()
+                || setting.taxonomy_id.is_some()
+                || setting.category_id.is_some()
+            {
+                return Err(invalid_budget_input("Group rollover requires groupId only"));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Writer validation must retain the spending error contract used by both
+// runtimes, including constraints rechecked after a concurrent edit.
+fn budget_write_error(error: anyhow::Error) -> anyhow::Error {
+    use wealthfolio_core::errors::{Error, ValidationError};
+    match error.downcast_ref::<Error>() {
+        Some(Error::Validation(ValidationError::InvalidInput(message))) => {
+            invalid_budget_input(message)
+        }
+        _ => error,
+    }
+}
+
+fn invalid_budget_input(message: &str) -> anyhow::Error {
+    SpendingError::InvalidInput {
+        message: message.to_string(),
+    }
+    .into()
+}
+
+fn validate_month_key(period_key: &str) -> Result<()> {
+    if period_key.len() != 7 || !period_key.is_ascii() {
+        return Err(invalid_budget_input("Invalid budget period key"));
+    }
+    if &period_key[4..5] != "-" {
+        return Err(invalid_budget_input("Invalid budget period key"));
+    }
+    let year = period_key[0..4]
+        .parse::<i32>()
+        .map_err(|_| invalid_budget_input("Invalid budget period key"))?;
+    let month = period_key[5..7]
+        .parse::<u32>()
+        .map_err(|_| invalid_budget_input("Invalid budget period key"))?;
+    if !(1..=12).contains(&month) {
+        return Err(invalid_budget_input("Invalid budget period key"));
+    }
+    NaiveDate::from_ymd_opt(year, month, 1)
+        .ok_or_else(|| invalid_budget_input("Invalid budget period key"))?;
+    Ok(())
+}
+
+fn period_key_for_date_in_tz(date: DateTime<Utc>, timezone: &str) -> String {
+    let d = wealthfolio_core::utils::time_utils::activity_date_in_user_timezone(date, timezone);
+    format!("{:04}-{:02}", d.year(), d.month())
+}
+
+fn month_end(period_key: &str) -> Result<DateTime<Utc>> {
+    let (year, month) = parse_month(period_key)?;
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    Ok(Utc
+        .with_ymd_and_hms(next_year, next_month, 1, 0, 0, 0)
+        .single()
+        .ok_or_else(|| invalid_budget_input("Invalid budget period key"))?
+        - chrono::Duration::milliseconds(1))
+}
+
+fn local_month_bounds_utc(
+    period_key: &str,
+    timezone: &str,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let (year, month) = parse_month(period_key)?;
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let tz = wealthfolio_core::utils::time_utils::parse_user_timezone_or_default(timezone);
+    let start = tz
+        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .earliest()
+        .ok_or_else(|| invalid_budget_input("Invalid budget period key"))?
+        .with_timezone(&Utc);
+    let next_start = tz
+        .with_ymd_and_hms(next_year, next_month, 1, 0, 0, 0)
+        .earliest()
+        .ok_or_else(|| invalid_budget_input("Invalid budget period key"))?
+        .with_timezone(&Utc);
+    Ok((start, next_start - chrono::Duration::nanoseconds(1)))
+}
+
+fn local_month_end_date(period_key: &str, timezone: &str) -> Result<NaiveDate> {
+    let (_, end) = local_month_bounds_utc(period_key, timezone)?;
+    Ok(wealthfolio_core::utils::time_utils::activity_date_in_user_timezone(end, timezone))
+}
+
+fn month_keys_between(start: &str, end: &str) -> Vec<String> {
+    let Ok((mut year, mut month)) = parse_month(start) else {
+        return Vec::new();
+    };
+    let Ok((end_year, end_month)) = parse_month(end) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while year < end_year || (year == end_year && month <= end_month) {
+        out.push(format!("{:04}-{:02}", year, month));
+        if month == 12 {
+            year += 1;
+            month = 1;
+        } else {
+            month += 1;
+        }
+    }
+    out
+}
+
+fn parse_month(period_key: &str) -> Result<(i32, u32)> {
+    validate_month_key(period_key)?;
+    let year = period_key[0..4]
+        .parse()
+        .map_err(|_| invalid_budget_input("Invalid budget period key"))?;
+    let month = period_key[5..7]
+        .parse()
+        .map_err(|_| invalid_budget_input("Invalid budget period key"))?;
+    Ok((year, month))
+}
+
+/// Canonical transient review state, including the same synthesized defaults as
+/// pure reads. Sorting avoids conflicts caused only by repository row order.
+pub fn canonical_review_state(mut state: BudgetSnapshotState) -> BudgetSnapshotState {
+    state.groups = effective_groups(state.groups);
+    state.groups.sort_by(|a, b| a.id.cmp(&b.id));
+    state.group_assignments.sort_by(|a, b| a.id.cmp(&b.id));
+    state.targets.sort_by(|a, b| a.id.cmp(&b.id));
+    state.rollover_settings.sort_by(|a, b| a.id.cmp(&b.id));
+    state
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use chrono::{NaiveDate, NaiveDateTime};
+    use wealthfolio_core::fx::{ExchangeRate, FxServiceTrait, NewExchangeRate};
+
+    use crate::activity_classification::within_spending_transfer_groups;
+
+    use super::*;
+
+    type CoreResult<T> = std::result::Result<T, wealthfolio_core::Error>;
+
+    /// Identity FX stub — same pattern as the analytics/insight test stubs.
+    struct PassthroughFx;
+
+    #[async_trait]
+    impl FxServiceTrait for PassthroughFx {
+        fn initialize(&self) -> CoreResult<()> {
+            Ok(())
+        }
+        fn get_historical_rates(&self, _: &str, _: &str, _: i64) -> CoreResult<Vec<ExchangeRate>> {
+            Ok(vec![])
+        }
+        fn get_latest_exchange_rate(&self, _: &str, _: &str) -> CoreResult<Decimal> {
+            Ok(Decimal::ONE)
+        }
+        fn get_exchange_rate_for_date(
+            &self,
+            _: &str,
+            _: &str,
+            _: NaiveDate,
+        ) -> CoreResult<Decimal> {
+            Ok(Decimal::ONE)
+        }
+        fn convert_currency(&self, amount: Decimal, _: &str, _: &str) -> CoreResult<Decimal> {
+            Ok(amount)
+        }
+        fn convert_currency_for_date(
+            &self,
+            amount: Decimal,
+            _: &str,
+            _: &str,
+            _: NaiveDate,
+        ) -> CoreResult<Decimal> {
+            Ok(amount)
+        }
+        fn get_latest_exchange_rates(&self) -> CoreResult<Vec<ExchangeRate>> {
+            Ok(vec![])
+        }
+        async fn add_exchange_rate(&self, _: NewExchangeRate) -> CoreResult<ExchangeRate> {
+            unimplemented!("PassthroughFx is read-only")
+        }
+        async fn update_exchange_rate(
+            &self,
+            _: &str,
+            _: &str,
+            _: Decimal,
+        ) -> CoreResult<ExchangeRate> {
+            unimplemented!("PassthroughFx is read-only")
+        }
+        async fn delete_exchange_rate(&self, _: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn register_currency_pair(&self, _: &str, _: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn register_currency_pair_manual(&self, _: &str, _: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn ensure_fx_pairs(&self, _: Vec<(String, String)>) -> CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    fn ts() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    }
+
+    fn target(
+        period_key: &str,
+        target_type: BudgetTargetType,
+        taxonomy_id: Option<&str>,
+        category_id: Option<&str>,
+        group_id: Option<&str>,
+        amount: &str,
+    ) -> BudgetTarget {
+        BudgetTarget {
+            id: format!(
+                "{}-{}-{}",
+                period_key,
+                category_id.or(group_id).unwrap_or("target"),
+                amount
+            ),
+            period_key: period_key.to_string(),
+            target_type,
+            taxonomy_id: taxonomy_id.map(str::to_string),
+            category_id: category_id.map(str::to_string),
+            group_id: group_id.map(str::to_string),
+            amount: amount.to_string(),
+            created_at: ts(),
+            updated_at: ts(),
+        }
+    }
+
+    fn rollover_setting(start_month: &str, starting_balance: &str) -> BudgetRolloverSetting {
+        BudgetRolloverSetting {
+            id: "rollover".to_string(),
+            target_type: BudgetRolloverTargetType::Category,
+            taxonomy_id: Some(SPENDING_TAXONOMY.to_string()),
+            category_id: Some("cat_groceries".to_string()),
+            group_id: None,
+            enabled: true,
+            start_month: start_month.to_string(),
+            starting_balance: starting_balance.to_string(),
+            created_at: ts(),
+            updated_at: ts(),
+        }
+    }
+
+    #[test]
+    fn excluded_subcategory_does_not_roll_into_parent_actuals() {
+        use crate::activity_assignments::ActivityTaxonomyAssignment;
+        use wealthfolio_core::taxonomies::Category;
+
+        let make_category = |id: &str, parent_id: Option<&str>| Category {
+            id: id.to_string(),
+            taxonomy_id: SPENDING_TAXONOMY.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            name: id.to_string(),
+            key: id.to_string(),
+            color: "#000".to_string(),
+            icon: None,
+            description: None,
+            sort_order: 0,
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        let categories = vec![
+            make_category("cat_shopping", None),
+            make_category("cat_reimbursable", Some("cat_shopping")),
+        ];
+        let meta = category_meta(&categories);
+        let exclusions = ExclusionIndex::new(&["cat_reimbursable".to_string()], &meta);
+
+        let mut assignments = crate::activity_allocations::AssignmentsByActivity::new();
+        assignments.insert(
+            "a1".to_string(),
+            vec![ActivityTaxonomyAssignment {
+                id: "asg-1".to_string(),
+                activity_id: "a1".to_string(),
+                taxonomy_id: SPENDING_TAXONOMY.to_string(),
+                category_id: "cat_reimbursable".to_string(),
+                weight: 10_000,
+                source: "manual".to_string(),
+                created_at: ts(),
+                updated_at: ts(),
+            }],
+        );
+        let splits = SplitsByActivity::new();
+
+        let mut month_actuals = MonthActuals::new();
+        add_allocated_actuals(
+            &mut month_actuals,
+            "a1",
+            SPENDING_TAXONOMY,
+            Decimal::new(75, 0),
+            &meta,
+            &assignments,
+            &splits,
+            &exclusions,
+            &PassthroughFx,
+            "USD",
+            "USD",
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+        );
+
+        // The excluded subcategory's spend must not roll up into the parent.
+        assert!(month_actuals.is_empty());
+    }
+
+    #[test]
+    fn seeded_groups_use_savings_label() {
+        let names = DEFAULT_GROUPS.iter().map(|g| g.name).collect::<Vec<_>>();
+
+        assert!(names.contains(&"Savings"));
+        assert!(!names.contains(&"Saving & Investment"));
+        assert!(!names.contains(&"Saving & Investments"));
+    }
+
+    #[test]
+    fn seeded_budget_group_sync_ids_are_uuids() {
+        for group in DEFAULT_GROUPS {
+            uuid::Uuid::parse_str(group.id).unwrap();
+        }
+        for assignment in DEFAULT_ASSIGNMENTS {
+            uuid::Uuid::parse_str(assignment.id).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_savings_assignment_uses_savings_taxonomy() {
+        let group_by_key = DEFAULT_GROUPS
+            .iter()
+            .map(|g| (g.key.to_string(), g.id.to_string()))
+            .collect::<HashMap<_, _>>();
+        let assignments = default_assignment_inputs(&group_by_key);
+        let savings = assignments
+            .iter()
+            .find(|a| a.category_id == "cat_savings")
+            .expect("seeded savings assignment");
+
+        assert_eq!(savings.taxonomy_id, SAVINGS_TAXONOMY);
+    }
+
+    #[test]
+    fn validates_budget_target_decimal_amount() {
+        let target = NewBudgetTarget {
+            id: None,
+            period_key: DEFAULT_PERIOD_KEY.to_string(),
+            target_type: BudgetTargetType::Category,
+            taxonomy_id: Some(SPENDING_TAXONOMY.to_string()),
+            category_id: Some("cat_groceries".to_string()),
+            group_id: None,
+            amount: "not-a-number".to_string(),
+        };
+
+        assert!(validate_budget_target(&target).is_err());
+    }
+
+    #[test]
+    fn validates_rollover_starting_balance_decimal_amount() {
+        let setting = NewBudgetRolloverSetting {
+            id: None,
+            target_type: BudgetRolloverTargetType::Category,
+            taxonomy_id: Some(SPENDING_TAXONOMY.to_string()),
+            category_id: Some("cat_groceries".to_string()),
+            group_id: None,
+            enabled: true,
+            start_month: "2026-01".to_string(),
+            starting_balance: "bad-balance".to_string(),
+        };
+
+        assert!(validate_rollover_setting(&setting).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Savings actuals regression
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal Activity with the fields relevant to classification.
+    fn make_transfer(
+        id: &str,
+        account_id: &str,
+        activity_type: &str,
+        source_group_id: Option<&str>,
+        date: chrono::DateTime<chrono::Utc>,
+    ) -> wealthfolio_core::activities::Activity {
+        use wealthfolio_core::activities::{Activity, ActivityStatus};
+        Activity {
+            id: id.to_string(),
+            account_id: account_id.to_string(),
+            asset_id: None,
+            activity_type: activity_type.to_string(),
+            activity_type_override: None,
+            source_type: None,
+            subtype: None,
+            status: ActivityStatus::Posted,
+            activity_date: date,
+            settlement_date: None,
+            quantity: None,
+            unit_price: None,
+            amount: Some(Decimal::new(500, 0)),
+            fee: None,
+            tax: None,
+            currency: "USD".to_string(),
+            fx_rate: None,
+            notes: None,
+            metadata: None::<serde_json::Value>,
+            source_system: None,
+            source_record_id: None,
+            source_group_id: source_group_id.map(str::to_string),
+            idempotency_key: None,
+            import_run_id: None,
+            is_user_modified: false,
+            needs_review: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn utc(year: i32, month: u32, day: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+            chrono::Utc,
+        )
+    }
+
+    fn savings_meta() -> HashMap<String, wealthfolio_core::taxonomies::Category> {
+        let make = |id: &str| wealthfolio_core::taxonomies::Category {
+            id: id.to_string(),
+            taxonomy_id: SAVINGS_TAXONOMY.to_string(),
+            parent_id: None,
+            name: id.to_string(),
+            key: id.to_string(),
+            color: "#000".to_string(),
+            icon: None,
+            description: None,
+            sort_order: 0,
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        [make("cat_savings")]
+            .into_iter()
+            .map(|c| (c.id.clone(), c))
+            .collect()
+    }
+
+    /// A TRANSFER_OUT from a cash account to an investing account (only one
+    /// leg in the spending context) must accumulate as a savings actual.
+    #[test]
+    fn cross_boundary_transfer_out_accumulates_as_savings_actual() {
+        use crate::activity_assignments::ActivityTaxonomyAssignment;
+
+        let out = make_transfer(
+            "t-out",
+            "acc-cash",
+            "TRANSFER_OUT",
+            Some("pair-invest"),
+            utc(2026, 5, 15),
+        );
+        let meta = savings_meta();
+        // Only the OUT leg is in the spending context — not an internal transfer.
+        let all = vec![&out];
+        let within = within_spending_transfer_groups(&all);
+        assert!(
+            within.is_empty(),
+            "single-leg transfer should not be internal"
+        );
+
+        let classification = classify_activity_for_aggregation(
+            &out,
+            wealthfolio_core::accounts::account_types::CASH,
+            &within,
+        );
+        assert_eq!(
+            classification,
+            crate::activity_classification::SpendingClassification::Saving,
+            "cross-boundary TRANSFER_OUT should classify as Saving"
+        );
+
+        // Assign the activity to cat_savings so it isn't uncategorized.
+        let mut assignments = crate::activity_allocations::AssignmentsByActivity::new();
+        assignments.insert(
+            "t-out".to_string(),
+            vec![ActivityTaxonomyAssignment {
+                id: "asg-savings".to_string(),
+                activity_id: "t-out".to_string(),
+                taxonomy_id: SAVINGS_TAXONOMY.to_string(),
+                category_id: "cat_savings".to_string(),
+                weight: 10_000,
+                source: "manual".to_string(),
+                created_at: ts(),
+                updated_at: ts(),
+            }],
+        );
+
+        let mut month_actuals = MonthActuals::new();
+        add_allocated_actuals(
+            &mut month_actuals,
+            &out.id,
+            SAVINGS_TAXONOMY,
+            classification.saving_amount(Decimal::new(500, 0)),
+            &meta,
+            &assignments,
+            &SplitsByActivity::new(),
+            &ExclusionIndex::empty(),
+            &PassthroughFx,
+            "USD",
+            "USD",
+            NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        );
+
+        let actual = month_actuals
+            .get(&(SAVINGS_TAXONOMY.to_string(), "cat_savings".to_string()))
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        assert_eq!(actual, Decimal::new(500, 0), "savings actual should be 500");
+    }
+
+    /// When both legs of a transfer are in the spending account set — even
+    /// when they fall in different calendar months — the transfer is internal
+    /// and must produce zero savings actuals.
+    #[test]
+    fn cross_month_internal_transfer_is_not_classified_as_saving() {
+        // OUT leg in January, IN leg in February — both spending accounts.
+        let out = make_transfer(
+            "t-out",
+            "acc-checking",
+            "TRANSFER_OUT",
+            Some("pair-internal"),
+            utc(2026, 1, 31),
+        );
+        let inn = make_transfer(
+            "t-in",
+            "acc-savings-cash",
+            "TRANSFER_IN",
+            Some("pair-internal"),
+            utc(2026, 2, 1),
+        );
+
+        // Pass the FULL account history (both months) so within_spending_groups sees both legs.
+        let all = vec![&out, &inn];
+        let within = within_spending_transfer_groups(&all);
+        assert!(
+            within.contains("pair-internal"),
+            "both legs present; transfer should be internal"
+        );
+
+        let classification = classify_activity_for_aggregation(
+            &out,
+            wealthfolio_core::accounts::account_types::CASH,
+            &within,
+        );
+
+        assert_eq!(
+            classification.saving_amount(Decimal::new(500, 0)),
+            Decimal::ZERO,
+            "cross-month internal transfer must not count as saving"
+        );
+        assert_eq!(
+            classification.spending_amount(Decimal::new(500, 0)),
+            Decimal::ZERO,
+            "cross-month internal transfer must not count as spending either"
+        );
+    }
+
+    #[test]
+    fn target_index_uses_sparse_month_overrides_over_defaults() {
+        let targets = vec![
+            target(
+                DEFAULT_PERIOD_KEY,
+                BudgetTargetType::Category,
+                Some(SPENDING_TAXONOMY),
+                Some("cat_groceries"),
+                None,
+                "200",
+            ),
+            target(
+                "2026-03",
+                BudgetTargetType::Category,
+                Some(SPENDING_TAXONOMY),
+                Some("cat_groceries"),
+                None,
+                "300",
+            ),
+            target(
+                DEFAULT_PERIOD_KEY,
+                BudgetTargetType::GroupBuffer,
+                None,
+                None,
+                Some(BUDGET_GROUP_NEEDS_ID),
+                "500",
+            ),
+        ];
+        let index = TargetIndex::new(&targets);
+
+        assert_eq!(
+            index.effective_category_decimal("2026-03", SPENDING_TAXONOMY, "cat_groceries"),
+            Decimal::new(300, 0)
+        );
+        assert_eq!(
+            index.effective_category_decimal("2026-04", SPENDING_TAXONOMY, "cat_groceries"),
+            Decimal::new(200, 0)
+        );
+        assert_eq!(
+            index.effective_category_decimal("2026-04", SPENDING_TAXONOMY, "cat_travel"),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            index.effective_group_buffer_decimal("2026-04", BUDGET_GROUP_NEEDS_ID),
+            Decimal::new(500, 0)
+        );
+        assert!(index.has_default_category(SPENDING_TAXONOMY, "cat_groceries"));
+        assert!(index.has_month_category("2026-03", SPENDING_TAXONOMY, "cat_groceries"));
+    }
+
+    #[test]
+    fn pure_group_resolution_repairs_only_other_and_preserves_custom_edits() {
+        let defaults = DEFAULT_GROUPS
+            .iter()
+            .map(|default| BudgetGroup {
+                id: default.id.into(),
+                name: default.name.into(),
+                key: default.key.into(),
+                color: Some(default.color.into()),
+                icon: Some(default.icon.into()),
+                sort_order: default.sort_order,
+                is_system: true,
+                created_at: DateTime::UNIX_EPOCH.naive_utc(),
+                updated_at: DateTime::UNIX_EPOCH.naive_utc(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(effective_groups(Vec::new()).len(), 1);
+        for removed in [
+            vec![],
+            vec![OTHER_GROUP_KEY],
+            vec!["needs", "wants", OTHER_GROUP_KEY],
+        ] {
+            let mut persisted = defaults
+                .iter()
+                .filter(|group| !removed.contains(&group.key.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(group) = persisted.first_mut() {
+                group.name = "My group".to_string();
+                group.color = Some("#123456".to_string());
+            }
+            let mut custom = defaults[0].clone();
+            custom.id = "custom".to_string();
+            custom.key = "custom".to_string();
+            custom.is_system = false;
+            persisted.push(custom);
+            let resolved = effective_groups(persisted.clone());
+            assert_eq!(
+                resolved.len(),
+                persisted.len() + usize::from(removed.contains(&OTHER_GROUP_KEY))
+            );
+            for original in persisted {
+                let found = resolved
+                    .iter()
+                    .find(|group| group.id == original.id)
+                    .unwrap();
+                assert_eq!(found.name, original.name);
+                assert_eq!(found.color, original.color);
+                assert_eq!(found.is_system, original.is_system);
+            }
+            assert_eq!(
+                resolved
+                    .iter()
+                    .find(|g| g.key == OTHER_GROUP_KEY)
+                    .unwrap()
+                    .id,
+                BUDGET_GROUP_OTHER_ID
+            );
+        }
+    }
+
+    #[test]
+    fn rollover_ignores_months_before_future_start_month() {
+        let setting = rollover_setting("2026-06", "25");
+
+        let (rollover_in, rollover_out, remaining) = compute_rollover_for_month(
+            &setting,
+            "2026-05",
+            |_| Decimal::new(100, 0),
+            |_| Decimal::new(40, 0),
+        );
+
+        assert_eq!(rollover_in, Decimal::ZERO);
+        assert_eq!(rollover_out, Decimal::ZERO);
+        assert_eq!(remaining, Decimal::new(60, 0));
+    }
+
+    #[test]
+    fn rollover_recomputes_multi_year_chain_from_start_month() {
+        let setting = rollover_setting("2025-01", "10");
+
+        let (rollover_in, rollover_out, remaining) = compute_rollover_for_month(
+            &setting,
+            "2026-05",
+            |_| Decimal::new(100, 0),
+            |month| match month {
+                "2025-01" => Decimal::new(25, 0),
+                "2026-05" => Decimal::new(40, 0),
+                _ => Decimal::ZERO,
+            },
+        );
+
+        assert_eq!(rollover_in, Decimal::new(1585, 0));
+        assert_eq!(rollover_out, Decimal::new(1645, 0));
+        assert_eq!(remaining, Decimal::new(1645, 0));
+    }
+
+    #[test]
+    fn missing_target_with_spending_creates_negative_remaining() {
+        let setting = rollover_setting("2026-05", "0");
+
+        let (rollover_in, rollover_out, remaining) = compute_rollover_for_month(
+            &setting,
+            "2026-05",
+            |_| Decimal::ZERO,
+            |_| Decimal::new(30, 0),
+        );
+
+        assert_eq!(rollover_in, Decimal::ZERO);
+        assert_eq!(rollover_out, Decimal::new(-30, 0));
+        assert_eq!(remaining, Decimal::new(-30, 0));
+    }
+
+    #[test]
+    fn refund_month_increases_remaining() {
+        let setting = rollover_setting("2026-05", "0");
+
+        let (rollover_in, rollover_out, remaining) = compute_rollover_for_month(
+            &setting,
+            "2026-05",
+            |_| Decimal::new(100, 0),
+            |_| Decimal::new(-25, 0),
+        );
+
+        assert_eq!(rollover_in, Decimal::ZERO);
+        assert_eq!(rollover_out, Decimal::new(125, 0));
+        assert_eq!(remaining, Decimal::new(125, 0));
+    }
+
+    #[test]
+    fn month_keys_are_strictly_validated() {
+        assert!(validate_period_key(DEFAULT_PERIOD_KEY).is_ok());
+        assert!(validate_period_key("2026-05").is_ok());
+        assert!(validate_period_key("2026-13").is_err());
+        assert!(validate_period_key("2026-5").is_err());
+    }
+
+    #[test]
+    fn local_month_bounds_follow_user_timezone() {
+        let (start, end) = local_month_bounds_utc("2026-05", "America/Toronto").unwrap();
+
+        assert_eq!(start.to_rfc3339(), "2026-05-01T04:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2026-06-01T03:59:59.999999999+00:00");
+        assert_eq!(
+            period_key_for_date_in_tz(start - chrono::Duration::milliseconds(1), "America/Toronto"),
+            "2026-04"
+        );
+        assert_eq!(
+            period_key_for_date_in_tz(start, "America/Toronto"),
+            "2026-05"
+        );
+        assert_eq!(period_key_for_date_in_tz(end, "America/Toronto"), "2026-05");
+    }
+
+    #[test]
+    fn local_month_end_date_uses_user_calendar_date() {
+        assert_eq!(
+            local_month_end_date("2026-05", "America/Toronto").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 31).unwrap()
+        );
+        assert_eq!(
+            local_month_end_date("2026-05", "Asia/Tokyo").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 31).unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_month_key_rejects_non_ascii_key() {
+        // 7 bytes, with byte 5 inside the 'é'
+        assert!(validate_month_key("2024é5").is_err());
+    }
+}

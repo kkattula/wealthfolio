@@ -1,0 +1,12 @@
+---
+source: crates/ai/tests/tool_outputs_parity.rs
+expression: result
+---
+{
+  "ok": {
+    "isStale": false,
+    "issues": [],
+    "note": "No health check has run yet in this session. Call get_health_status with refresh: true to run one.",
+    "overallSeverity": "NOT_COMPUTED"
+  }
+}

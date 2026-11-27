@@ -1,0 +1,91 @@
+import i18n from "i18next";
+import { logger, deleteQuote, updateQuote } from "@/adapters";
+import { toast } from "@wealthfolio/ui/components/ui/use-toast";
+import { QueryKeys } from "@/lib/query-keys";
+import { invalidatePerformanceCaches } from "@/lib/performance-cache";
+import { Quote } from "@/lib/types";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
+
+interface UseQuoteMutationsOptions {
+  invalidateOnSuccess?: boolean;
+  /** Show the generic "Quote saved" toasts; errors are always reported. */
+  notifyOnSuccess?: boolean;
+}
+
+export const useQuoteMutations = (
+  assetId: string,
+  { invalidateOnSuccess = true, notifyOnSuccess = true }: UseQuoteMutationsOptions = {},
+) => {
+  const queryClient = useQueryClient();
+
+  const invalidateQuoteQueries = useCallback(async () => {
+    invalidatePerformanceCaches(queryClient);
+    // A new value can end a stale valuation in Health Center. Not awaited: a
+    // full health check should not hold the save.
+    void queryClient.invalidateQueries({ queryKey: [QueryKeys.HEALTH_STATUS] });
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: [QueryKeys.ASSET_DATA, assetId] }),
+      queryClient.invalidateQueries({ queryKey: [QueryKeys.QUOTE_HISTORY, assetId] }),
+      queryClient.invalidateQueries({ queryKey: [QueryKeys.LATEST_QUOTES] }),
+      queryClient.invalidateQueries({ queryKey: [QueryKeys.ALTERNATIVE_HOLDINGS] }),
+      queryClient.invalidateQueries({ queryKey: [QueryKeys.NET_WORTH] }),
+      queryClient.invalidateQueries({ queryKey: [QueryKeys.NET_WORTH_HISTORY] }),
+    ]);
+  }, [assetId, queryClient]);
+
+  const handleSuccess = (message: string) => {
+    if (invalidateOnSuccess) {
+      void invalidateQuoteQueries();
+    }
+    if (!notifyOnSuccess) return;
+    toast({
+      title: message,
+      variant: "success",
+    });
+  };
+
+  const handleError = (action: string) => {
+    toast({
+      title: i18n.t("settings:settings_update_error_title"),
+      description: i18n.t(`asset:notifications.${action}`),
+      variant: "destructive",
+    });
+  };
+
+  const saveQuoteMutation = useMutation({
+    mutationFn: async (quote: Quote) => {
+      await updateQuote(assetId, {
+        ...quote,
+        dataSource: "MANUAL",
+        assetId: assetId,
+        createdAt: quote.createdAt || new Date().toISOString(),
+      });
+    },
+    onSuccess: (_, quote) => {
+      handleSuccess(
+        i18n.t(quote.id ? "asset:notifications.quote_updated" : "asset:notifications.quote_added"),
+      );
+    },
+    onError: (error) => {
+      logger.error(`Error saving quote: ${error}`);
+      handleError("quote_save_failed");
+    },
+  });
+
+  const deleteQuoteMutation = useMutation({
+    mutationFn: deleteQuote,
+    onSuccess: () => {
+      handleSuccess(i18n.t("asset:notifications.quote_deleted"));
+    },
+    onError: (error) => {
+      logger.error(`Error deleting quote: ${error}`);
+      handleError("quote_delete_failed");
+    },
+  });
+
+  return {
+    saveQuoteMutation,
+    deleteQuoteMutation,
+  };
+};

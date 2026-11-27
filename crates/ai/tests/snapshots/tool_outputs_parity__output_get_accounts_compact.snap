@@ -1,0 +1,31 @@
+---
+source: crates/ai/tests/tool_outputs_parity.rs
+expression: result
+---
+{
+  "ok": {
+    "accounts": [
+      {
+        "accountType": "SECURITIES",
+        "currency": "USD",
+        "id": "acc-1",
+        "isActive": true,
+        "isArchived": false,
+        "isDefault": false,
+        "name": "Brokerage",
+        "trackingMode": "TRANSACTIONS"
+      },
+      {
+        "accountType": "CASH",
+        "currency": "EUR",
+        "id": "acc-2",
+        "isActive": true,
+        "isArchived": false,
+        "isDefault": false,
+        "name": "Savings",
+        "trackingMode": "TRANSACTIONS"
+      }
+    ],
+    "count": 2
+  }
+}

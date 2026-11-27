@@ -1,0 +1,293 @@
+import { getCategoryLabel } from "@/lib/taxonomy-labels";
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+  Icons,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetScreen,
+  SheetScreenTrigger,
+  SheetTitle,
+  SheetTrigger,
+  useInSheetNavigation,
+} from "@wealthfolio/ui";
+
+import { useIsMobileViewport } from "@/hooks/use-platform";
+import { useTaxonomy } from "@/hooks/use-taxonomies";
+import type { TaxonomyCategory } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+import { CategoryIconTile } from "./category-chips";
+
+const SPENDING_TAXONOMY = "spending_categories";
+const INCOME_TAXONOMY = "income_sources";
+const SAVINGS_TAXONOMY = "savings_categories";
+
+export type QuickCategorizeScope = "expense" | "income" | "saving" | "both" | "all";
+
+export interface QuickCategorizePopoverProps {
+  trigger: React.ReactElement;
+  selectedCategoryId?: string | null;
+  /** Category bucket to show. Categories label the cash-flow bucket; they do not change it. */
+  scope?: QuickCategorizeScope;
+  onSelect: (taxonomyId: string, categoryId: string) => void;
+  onClear?: () => void;
+  align?: "start" | "center" | "end";
+  /** The screen's title on phones; the field's own label, so the two match. */
+  title?: string;
+}
+
+export interface FlatOption {
+  taxonomyId: string;
+  category: TaxonomyCategory;
+  parent: TaxonomyCategory | null;
+  group: "Expense" | "Savings" | "Income";
+}
+
+// Children's sortOrder is relative to their siblings, so a flat sort interleaves
+// levels. Categories whose parent is missing are listed as top level.
+export function flattenTaxonomy(
+  taxonomyId: string,
+  cats: TaxonomyCategory[],
+  group: FlatOption["group"],
+): FlatOption[] {
+  const byId = new Map(cats.map((c) => [c.id, c]));
+  const parentIdOf = (c: TaxonomyCategory) =>
+    c.parentId && byId.has(c.parentId) ? c.parentId : null;
+  const walk = (parent: TaxonomyCategory | null): FlatOption[] =>
+    cats
+      .filter((c) => parentIdOf(c) === (parent?.id ?? null))
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .flatMap((c) => [{ taxonomyId, category: c, parent, group }, ...walk(c)]);
+  return walk(null);
+}
+
+export function QuickCategorizePopover({
+  trigger,
+  selectedCategoryId,
+  scope = "both",
+  onSelect,
+  onClear,
+  align = "start",
+  title,
+}: QuickCategorizePopoverProps) {
+  const { t } = useTranslation();
+  const groupLabels: Record<FlatOption["group"], string> = {
+    Expense: t("spending:cashFlow.spending"),
+    Savings: t("spending:cashFlow.saving"),
+    Income: t("spending:cashFlow.income"),
+  };
+  const isMobile = useIsMobileViewport();
+  const inSheetNavigation = useInSheetNavigation();
+  const fillsSheet = isMobile || inSheetNavigation;
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const spending = useTaxonomy(SPENDING_TAXONOMY);
+  const income = useTaxonomy(INCOME_TAXONOMY);
+  const savings = useTaxonomy(SAVINGS_TAXONOMY);
+
+  const options = useMemo<FlatOption[]>(() => {
+    const out: FlatOption[] = [];
+    if (scope === "expense" || scope === "both" || scope === "all") {
+      out.push(...flattenTaxonomy(SPENDING_TAXONOMY, spending.data?.categories ?? [], "Expense"));
+    }
+    if (scope === "saving" || scope === "all") {
+      out.push(...flattenTaxonomy(SAVINGS_TAXONOMY, savings.data?.categories ?? [], "Savings"));
+    }
+    if (scope === "income" || scope === "both" || scope === "all") {
+      out.push(...flattenTaxonomy(INCOME_TAXONOMY, income.data?.categories ?? [], "Income"));
+    }
+    return out;
+  }, [spending.data?.categories, savings.data?.categories, income.data?.categories, scope]);
+
+  // cmdk's own filter ranks rows by score, which breaks the tree and hides the
+  // parent of a matching child. Keep tree order and show each match with its
+  // ancestors and descendants. Ancestors that only give context are disabled so
+  // cmdk highlights the first real match and Enter picks it.
+  const { visible, contextOnly } = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    if (!query) return { visible: options, contextOnly: new Set<FlatOption>() };
+    const byKey = new Map(options.map((o) => [`${o.taxonomyId}:${o.category.id}`, o]));
+    const ancestorsOf = (o: FlatOption) => {
+      const out: FlatOption[] = [];
+      for (let p = o.parent; p;) {
+        const po = byKey.get(`${o.taxonomyId}:${p.id}`);
+        if (!po) break;
+        out.push(po);
+        p = po.parent;
+      }
+      return out;
+    };
+    const matches = (o: FlatOption) =>
+      o.category.name.toLowerCase().includes(query) ||
+      getCategoryLabel(t, o.taxonomyId, o.category.id, o.category.name)
+        .toLowerCase()
+        .includes(query);
+    const isHit = (o: FlatOption) => matches(o) || ancestorsOf(o).some(matches);
+    const context = new Set<FlatOption>();
+    options
+      .filter(matches)
+      .forEach((o) => ancestorsOf(o).forEach((a) => !isHit(a) && context.add(a)));
+    return {
+      visible: options.filter((o) => isHit(o) || context.has(o)),
+      contextOnly: context,
+    };
+  }, [options, search, t]);
+
+  const grouped = useMemo(() => {
+    const groups: Record<FlatOption["group"], FlatOption[]> = {
+      Expense: [],
+      Savings: [],
+      Income: [],
+    };
+    visible.forEach((o) => groups[o.group].push(o));
+    return groups;
+  }, [visible]);
+
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next);
+    if (!next) setSearch("");
+  };
+
+  const handleSelect = (opt: FlatOption) => {
+    onSelect(opt.taxonomyId, opt.category.id);
+    handleOpenChange(false);
+  };
+
+  const handleClear = () => {
+    onClear?.();
+    handleOpenChange(false);
+  };
+
+  const commandContent = (
+    <Command
+      shouldFilter={false}
+      className={cn(
+        fillsSheet &&
+          "h-auto min-h-0 flex-auto rounded-none bg-transparent [&_[data-slot=command-input-wrapper]]:shrink-0",
+      )}
+    >
+      <CommandInput
+        value={search}
+        onValueChange={setSearch}
+        placeholder={t("spending:category.searchCategories")}
+      />
+      <CommandList className={cn(fillsSheet && "max-h-none min-h-0 flex-auto")}>
+        <CommandEmpty>{t("spending:category.noCategoriesFound")}</CommandEmpty>
+        {(["Expense", "Savings", "Income"] as const).map((groupKey) => {
+          const items = grouped[groupKey];
+          if (items.length === 0) return null;
+          return (
+            <CommandGroup key={groupKey} heading={groupLabels[groupKey]}>
+              {items.map((opt) => {
+                const label = getCategoryLabel(
+                  t,
+                  opt.taxonomyId,
+                  opt.category.id,
+                  opt.category.name,
+                );
+                const isSelected = selectedCategoryId === opt.category.id;
+                const isChild = opt.parent !== null;
+                return (
+                  <CommandItem
+                    key={`${opt.taxonomyId}:${opt.category.id}`}
+                    value={`${groupKey} ${opt.parent?.name ?? ""} / ${opt.category.name} ${label}`}
+                    onSelect={() => handleSelect(opt)}
+                    disabled={contextOnly.has(opt)}
+                    className={cn(
+                      "flex items-center gap-2",
+                      isChild && "in-[[data-sheet-screen]]:ps-14 ps-8",
+                    )}
+                  >
+                    <CategoryIconTile
+                      icon={opt.category.icon ?? null}
+                      color={opt.category.color ?? null}
+                    />
+                    <span className={cn("truncate", !isChild && "font-medium")}>{label}</span>
+                    {isSelected && (
+                      <Icons.Check
+                        data-slot="command-item-check"
+                        className="text-muted-foreground ms-auto h-3.5 w-3.5"
+                      />
+                    )}
+                  </CommandItem>
+                );
+              })}
+            </CommandGroup>
+          );
+        })}
+        {/* Hidden while searching: with no match it would be the only row, and
+            Enter would clear the category. */}
+        {selectedCategoryId && onClear && !search.trim() && (
+          <>
+            <CommandSeparator />
+            <CommandGroup>
+              <CommandItem
+                onSelect={handleClear}
+                className="text-muted-foreground justify-center text-center"
+              >
+                {t("spending:category.clearCategory")}
+              </CommandItem>
+            </CommandGroup>
+          </>
+        )}
+      </CommandList>
+    </Command>
+  );
+
+  // In a phone form's sheet the list opens as a screen of that sheet, with a back
+  // button. Elsewhere phones get a full-width bottom sheet, as the ticker search
+  // does; a narrow popover would cover what it belongs to.
+  if (inSheetNavigation) {
+    return (
+      <>
+        <SheetScreenTrigger render={trigger} open={open} onOpenChange={handleOpenChange} />
+        <SheetScreen
+          open={open}
+          onOpenChange={handleOpenChange}
+          title={title ?? t("spending:cashForm.pickCategory")}
+        >
+          {commandContent}
+        </SheetScreen>
+      </>
+    );
+  }
+
+  if (isMobile) {
+    return (
+      <Sheet open={open} onOpenChange={handleOpenChange}>
+        <SheetTrigger render={trigger} />
+        <SheetContent
+          side="bottom"
+          className="mx-1 flex flex-col gap-0 overflow-hidden rounded-t-4xl p-0 [--overlay-max-height:85dvh]"
+        >
+          <SheetHeader className="shrink-0 border-b px-4 py-4 pe-16 text-start">
+            <SheetTitle>{t("spending:cashForm.pickCategory")}</SheetTitle>
+          </SheetHeader>
+          {commandContent}
+        </SheetContent>
+      </Sheet>
+    );
+  }
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger render={trigger} />
+      <PopoverContent className="w-70 p-0" align={align}>
+        {commandContent}
+      </PopoverContent>
+    </Popover>
+  );
+}

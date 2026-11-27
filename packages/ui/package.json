@@ -1,0 +1,104 @@
+{
+  "name": "@wealthfolio/ui",
+  "version": "3.13.1",
+  "type": "module",
+  "description": "Wealthfolio UI components based on shadcn/ui and Tailwind CSS",
+  "main": "dist/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/src/index.d.ts"
+    },
+    "./chart": {
+      "import": "./dist/chart.js",
+      "types": "./dist/src/chart.d.ts"
+    },
+    "./styles": {
+      "import": "./dist/styles.css"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "wealthfolio",
+    "ui",
+    "components",
+    "shadcn",
+    "tailwind",
+    "react",
+    "components"
+  ],
+  "author": "Wealthfolio Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wealthfolio/wealthfolio.git",
+    "directory": "packages/ui"
+  },
+  "bugs": {
+    "url": "https://github.com/wealthfolio/wealthfolio/issues"
+  },
+  "homepage": "https://github.com/wealthfolio/wealthfolio/tree/main/packages/ui#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup && pnpm run build:types",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "lint": "pnpm --dir ../.. exec oxlint --type-aware packages/ui && pnpm lint:eslint",
+    "lint:fix": "pnpm --dir ../.. exec oxlint --type-aware --fix packages/ui && pnpm lint:eslint --fix",
+    "lint:quiet": "pnpm --dir ../.. exec oxlint --type-aware --quiet packages/ui && pnpm lint:eslint --quiet",
+    "lint:eslint": "eslint .",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "type-check": "tsc --noEmit",
+    "build:types": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@base-ui/react": "1.9.0",
+    "@internationalized/date": "^3.12.4",
+    "@internationalized/number": "^3.6.9",
+    "@number-flow/react": "^0.6.2",
+    "@phosphor-icons/react": "^2.1.10",
+    "@react-aria/i18n": "^3.13.1",
+    "@tanstack/react-query": "^5.106.1",
+    "@tanstack/react-table": "^8.21.3",
+    "@tanstack/react-virtual": "^3.14.26",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "date-fns": "^4.4.0",
+    "embla-carousel-react": "^8.6.0",
+    "input-otp": "^1.5.0",
+    "lucide-react": "^1.70.0",
+    "motion": "^14.10.1",
+    "nanoid": "^6.0.2",
+    "react-aria-components": "^1.22.1",
+    "react-day-picker": "^10.0.2",
+    "react-hook-form": "^7.91.0",
+    "react-number-format": "^5.4.5",
+    "recharts": "^3.10.1",
+    "sonner": "^2.0.8",
+    "tailwind-merge": "^3.7.0"
+  },
+  "peerDependencies": {
+    "i18next": "^25.6.0 || ^26.0.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-i18next": "^16.0.0 || ^17.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "i18next": "^26.7.2",
+    "react-i18next": "^17.1.13",
+    "tsup": "^9.0.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vite": "^8.3.7"
+  }
+}
